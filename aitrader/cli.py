@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
 import sys
 import time
 from collections import Counter
@@ -14,9 +13,9 @@ from .llm import CachedModel, GeminiModel, LLMConfigError, LLMError, RuleModel
 from .market import MIN_BARS, fetch_klines, fetch_price
 from .portfolio import Portfolio
 from .risk import RiskConfig, RiskManager
+from .runtime import INTERVAL_SECS, StopFlag, handle_signals, wait
 from .state import acquire_lock, load_json, save_json
 
-INTERVAL_SECS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 FETCH_BARS = 120  # 每次決策抓的 K 線數(>= MIN_BARS)
 BAR_RETRIES = 3  # 模型暫時失敗時,同一根 K 線最多重試幾次(間隔 --check-every)
 
@@ -102,27 +101,8 @@ def cmd_replay(a) -> int:
 
 # ------------------------------ paper ------------------------------
 
-class _StopFlag:
-    """SIGINT / SIGTERM:第一次只設旗標,在安全點存檔結束;第二次才強制中斷。"""
-
-    def __init__(self) -> None:
-        self.requested = False
-
-    def __call__(self, signum, frame) -> None:
-        if self.requested:
-            raise KeyboardInterrupt
-        self.requested = True
-        print("\n[paper] 收到停止訊號,處理完目前這一步就存檔結束(再按一次強制結束)", flush=True)
-
-
-def _wait(seconds: float, stop: _StopFlag) -> bool:
-    """可被停止訊號打斷的等待;回傳 False 表示被要求停止。"""
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        if stop.requested:
-            return False
-        time.sleep(min(1.0, end - time.monotonic()))
-    return not stop.requested
+def _wait(seconds: float, stop: StopFlag) -> bool:
+    return wait(seconds, stop, time)  # 以本模組的 time 計時,測試可替換成假時鐘
 
 
 def cmd_paper(a) -> int:
@@ -135,23 +115,15 @@ def cmd_paper(a) -> int:
     path = a.state or os.path.join("state", f"paper_{a.symbol}_{a.model}.json")
     journal = a.journal or os.path.join("journal", f"paper_{a.symbol}_{a.model}.jsonl")
     lock = acquire_lock(path)
-    stop = _StopFlag()
-    old = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            old[sig] = signal.signal(sig, stop)
-        except ValueError:
-            pass
     try:
-        return _paper_loop(a, rc, model, path, journal, stop)
+        with handle_signals(StopFlag("paper")) as stop:
+            return _paper_loop(a, rc, model, path, journal, stop)
     finally:
-        for sig, h in old.items():
-            signal.signal(sig, h)
         if lock:
             lock.close()
 
 
-def _paper_loop(a, rc: RiskConfig, model, path: str, journal: str, stop: _StopFlag) -> int:
+def _paper_loop(a, rc: RiskConfig, model, path: str, journal: str, stop: StopFlag) -> int:
     if os.path.exists(path) and not a.reset:
         d = load_json(path)
         if d.get("symbol") != a.symbol or d.get("interval") != a.interval or d.get("model") != a.model:
@@ -240,6 +212,9 @@ def cmd_report(a) -> int:
                     continue
     if not recs:
         raise ValueError("日誌是空的")
+    if any(str(r.get("kind", "")).startswith("grid") for r in recs):
+        from .grid_cli import report_grid
+        return report_grid(a.journal, recs)
     decided = [r for r in recs if r.get("decision")]
     actions = Counter(r["decision"]["action"] for r in decided)
     trades = [r["trade"] for r in recs if r.get("trade")]
@@ -330,7 +305,10 @@ def main(argv=None) -> int:
     p.add_argument("--journal", help="決策日誌(預設 journal/replay_<SYMBOL>_<MODEL>.jsonl)")
     p.set_defaults(fn=cmd_replay)
 
-    p = sub.add_parser("report", help="檢視決策日誌")
+    from .grid_cli import add_parsers as add_grid_parsers  # 延遲載入,避免循環匯入
+    add_grid_parsers(sub)
+
+    p = sub.add_parser("report", help="檢視決策日誌(一般模式與網格模式皆可)")
     p.add_argument("journal", help="日誌路徑,如 journal/paper_BTCUSDT_gemini.jsonl")
     p.set_defaults(fn=cmd_report)
 

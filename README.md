@@ -6,6 +6,10 @@
 - **只模擬,不下真單**,也不構成投資建議。
 - AI 只提供建議;停損、單日虧損上限、持倉上限、交易次數等規則由程式強制執行。
 - 每次決策(含 AI 的理由)都記錄到決策日誌,方便事後檢討。
+- 兩種模式:
+  - **目標持倉模式**(`once` / `paper` / `replay`):AI 每根 K 線決定要持有多少比例的幣,交易次數少。
+  - **AI 調整網格模式**(`grid` / `grid-replay`):AI 每根 K 線決定網格區間與格數(或暫停),
+    網格每幾秒撮合一次,負責頻繁的小額低買高賣。AI 費用和目標持倉模式一樣,成交次數多很多。
 
 ## 技術棧
 - Python 3.9+,**僅用標準庫**(`urllib`、`json`、`unittest`),無第三方依賴
@@ -48,6 +52,15 @@ python3 -m aitrader replay --model rule --limit 1000 --every 1
 
 # 5. 檢視決策日誌
 python3 -m aitrader report journal/paper_BTCUSDT_gemini.jsonl
+
+# 6. AI 調整網格:模擬盤(每 5 秒撮合網格,每小時問 Gemini 是否調整)
+python3 -m aitrader grid
+
+# 7. AI 調整網格:歷史回放(先用規則模型看看,不花錢)
+python3 -m aitrader grid-replay --model rule --limit 1000 --every 1
+
+# 8. 檢視網格日誌(report 會自動辨識)
+python3 -m aitrader report journal/grid_BTCUSDT_gemini.jsonl
 ```
 
 ### 子指令
@@ -57,7 +70,9 @@ python3 -m aitrader report journal/paper_BTCUSDT_gemini.jsonl
 | `once` | 用即時行情問一次模型,顯示決策與風控結果。不改任何狀態,適合確認金鑰與模型設定。 |
 | `paper` | 模擬盤。狀態存在 `state/`,重跑相同指令自動接續;Ctrl+C 會在安全點存檔結束(再按一次強制結束)。 |
 | `replay` | 歷史回放。決策後以**下一根 K 線開盤價**成交(避免偷看未來);每根 K 線都檢查停損。Gemini 回覆會快取在 `cache/`,重跑不重複付費。 |
-| `report` | 統計決策日誌:各種決策次數、成交、已實現損益、手續費、被風控擋下的原因、token 用量、最近決策與理由。 |
+| `report` | 統計決策日誌:各種決策次數、成交、已實現損益、手續費、被風控擋下的原因、token 用量、最近決策與理由。網格日誌會自動改用網格報表。 |
+| `grid` | AI 調整網格的模擬盤,說明見下方「AI 調整網格模式」。 |
+| `grid-replay` | AI 調整網格的歷史回放。 |
 
 ### 共用參數
 
@@ -88,7 +103,34 @@ python3 -m aitrader report journal/paper_BTCUSDT_gemini.jsonl
 - `paper`:`--check-every`(兩根 K 線之間檢查停損的秒數,預設 60)、`--state`、`--journal`、`--reset`、`--max-steps`(問模型幾次後結束)。
 - `replay`:`--limit`(K 線根數,預設 500)、`--every`(每幾根問一次,預設 4)、`--max-calls`(Gemini 實際呼叫上限,預設 100,快取命中不計)、`--cache-dir`、`--journal`。
 
-## 運作方式
+## AI 調整網格模式
+
+分工:**AI 決定「在哪個區間、切幾格」,網格負責「頻繁小額低買高賣」**。
+
+- 每 `--tick` 秒(預設 5)取一次現價撮合網格:跌破買單價就買,漲過賣單價就賣(穿價才算成交)。
+- 每根 `--interval` K 線(預設 1h)收盤後問 AI,AI 回覆以下三種之一:
+  - `KEEP`:維持現狀(預設;重設網格要付手續費)。
+  - `SET`:以現價為中心重設網格,下緣 `lower_pct`% / 上緣 `upper_pct`% / `grids` 格(可不對稱)。
+  - `PAUSE`:撤掉網格、全部賣出(例如明顯跌破)。之後再 `SET` 才恢復。
+- 重設網格時只買賣「新舊網格所需持幣的差額」,不會先全部賣掉再買回。
+- 強制規則:跌破區間下緣再往下 `--stop-loss`% 停損;權益單日跌 `--daily-loss-limit`%,清倉。兩者觸發後**當日(UTC)停機、不問 AI**。
+
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `--interval` | `1h` | 多久問一次 AI |
+| `--tick` | 5 | 撮合網格的價格更新秒數(僅 `grid`) |
+| `--min-confidence` | 0.6 | `SET` / `PAUSE` 的信心門檻,低於此值維持現狀 |
+| `--min-spacing` | 0.5 | 最小格距 %。AI 要求的格數太多會自動減少(手續費 0.1% 時,一買一賣打平約需 0.2%) |
+| `--max-range` | 15 | 區間上下緣各自最多離現價幾 %,超過會截斷 |
+| `--stop-loss` | 5 | 區間下緣再往下幾 % 停損;0 = 不設 |
+| `--daily-loss-limit` | 3 | 權益單日下跌達此 % 清倉,當日停機 |
+| `--max-reconfigs` | 4 | 每日最多重設 / 暫停次數 |
+| `--min-change` | 1 | 新舊區間上下緣都差不到此 %、且格數相同時不重設 |
+
+另有 `--state`、`--journal`、`--reset`、`--max-steps`(`grid`)與 `--limit`、`--every`、`--max-calls`、`--cache-dir`(`grid-replay`),意義同上。
+回放時 K 線內部走勢未知,以保守路徑(陽線先探低、陰線先拉高)撮合,成交次數會比實際少。
+
+## 運作方式(目標持倉模式)
 
 每個決策點:
 1. **強制風控**:單日虧損上限、停損、停利。觸發就直接清倉,**不問 AI**。
@@ -113,9 +155,13 @@ aitrader/
   portfolio.py  模擬帳戶(目標持倉再平衡、手續費、滑價)
   risk.py       風控(強制出場與決策過濾)
   agent.py      單步決策流程、歷史回放
+  grid.py       網格引擎(等比網格、從既有持倉重建、停損)
+  grid_agent.py AI 調整網格:風控、套用 AI 決策、歷史回放
+  grid_cli.py   grid / grid-replay 指令與網格報表
+  runtime.py    安全停止(訊號)與可中斷等待
   state.py      狀態原子寫入、檔案鎖、決策日誌
   cli.py        命令列入口(python3 -m aitrader)
-tests/          單元測試(Gemini 以模擬 HTTP 回應測試,不需金鑰)
+tests/          單元測試(Gemini 以模擬 HTTP 回應測試,不需金鑰;test_grid.py 為網格模式)
 state/ journal/ cache/   執行時產生(已 gitignore)
 doc/            過程文件
 ```
