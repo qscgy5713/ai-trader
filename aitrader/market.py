@@ -4,9 +4,10 @@ from __future__ import annotations
 import json
 import math
 import urllib.request
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Tuple
 
 BINANCE = "https://api.binance.com"
+BINANCE_FUTURES = "https://fapi.binance.com"  # USDT 永續合約
 
 
 class Candle(NamedTuple):
@@ -23,8 +24,8 @@ def _get(url: str):
         return json.load(r)
 
 
-def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> List[Candle]:
-    """最近 limit 根「已收盤」K 線(>1000 自動往回分頁)。
+def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200, futures: bool = False) -> List[Candle]:
+    """最近 limit 根「已收盤」K 線(>1000 自動往回分頁)。futures=True 取 USDT 永續合約的 K 線。
 
     不帶 endTime 的第一頁最後一根是形成中的 K 線,直接丟掉,並多要一根補回。"""
     if limit < 1:
@@ -34,7 +35,8 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> List[Ca
     while len(out) < limit:
         need = limit - len(out)
         n = min(1000, need + 1 if first else need)
-        data = _get(f"{BINANCE}/api/v3/klines?symbol={symbol}&interval={interval}&limit={n}{end}")
+        url = (f"{BINANCE_FUTURES}/fapi/v1/klines" if futures else f"{BINANCE}/api/v3/klines")
+        data = _get(f"{url}?symbol={symbol}&interval={interval}&limit={n}{end}")
         if not data:
             break
         rows = data[:-1] if first else data
@@ -48,6 +50,28 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> List[Ca
 
 def fetch_price(symbol: str) -> float:
     return float(_get(f"{BINANCE}/api/v3/ticker/price?symbol={symbol}")["price"])
+
+
+def fetch_premium(symbol: str) -> Tuple[float, float, float]:
+    """合約 (標記價格, 目前預估資金費率, 下次結算時間秒)。"""
+    d = _get(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex?symbol={symbol}")
+    return float(d["markPrice"]), float(d["lastFundingRate"]), d["nextFundingTime"] / 1000
+
+
+def fetch_funding_history(symbol: str, start_ts: float, end_ts: float) -> List[Tuple[float, float]]:
+    """[start_ts, end_ts] 之間的歷史資金費率 [(結算時間秒, 費率)],依時間排序。"""
+    out: List[Tuple[float, float]] = []
+    start = int(start_ts * 1000)
+    end = int(end_ts * 1000)
+    while start <= end:
+        rows = _get(f"{BINANCE_FUTURES}/fapi/v1/fundingRate?symbol={symbol}&startTime={start}&endTime={end}&limit=1000")
+        if not rows:
+            break
+        out += [(r["fundingTime"] / 1000, float(r["fundingRate"])) for r in rows]
+        if len(rows) < 1000:
+            break
+        start = rows[-1]["fundingTime"] + 1
+    return out
 
 
 # ---------------- 指標 ----------------

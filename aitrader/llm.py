@@ -354,3 +354,75 @@ def parse_reflection(text: str) -> Reflection:
         raise LLMError("檢討輸出格式錯誤:需要 summary 字串與 lessons 陣列")
     lessons = [x.strip()[:200] for x in d["lessons"] if isinstance(x, str) and x.strip()]
     return Reflection(d["summary"].strip()[:500], lessons[:MAX_LESSONS])
+
+
+# ---------------- 合約模式:AI 決定多空方向與槓桿 ----------------
+
+FUTURES_ACTIONS = ("LONG", "SHORT", "FLAT", "HOLD")
+MAX_MODEL_LEVERAGE = 10.0  # 模型輸出的格式上限;實際上限由風控 --max-leverage 決定
+
+
+@dataclass
+class FuturesDecision:
+    action: str  # LONG 做多 / SHORT 做空 / FLAT 平倉空手 / HOLD 維持
+    leverage: float  # LONG / SHORT 的目標槓桿(曝險 / 權益),例如 1.5
+    confidence: float
+    reason: str
+
+
+FUTURES_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "action": {"type": "STRING", "enum": list(FUTURES_ACTIONS)},
+        "leverage": {"type": "NUMBER", "description": "LONG/SHORT only: target leverage (position notional / equity), "
+                                                      "must not exceed max_leverage. 0 for FLAT/HOLD"},
+        "confidence": {"type": "NUMBER", "description": "0-1"},
+        "reason": {"type": "STRING", "description": "brief rationale in Traditional Chinese, <= 200 chars"},
+    },
+    "required": ["action", "leverage", "confidence", "reason"],
+    "propertyOrdering": ["action", "leverage", "confidence", "reason"],
+}
+
+
+def parse_futures_decision(text: str) -> FuturesDecision:
+    """嚴格解析合約決策。LONG / SHORT 的槓桿必須 > 0;FLAT / HOLD 的槓桿忽略。"""
+    try:
+        d = json.loads(text)
+    except (ValueError, TypeError) as e:
+        raise LLMError(f"模型輸出不是合法 JSON:{str(text)[:120]!r}") from e
+    if not isinstance(d, dict):
+        raise LLMError("模型輸出不是 JSON 物件")
+    action = d.get("action")
+    if action not in FUTURES_ACTIONS:
+        raise LLMError(f"action 不合法:{action!r}")
+    try:
+        conf = float(d["confidence"])
+        lev = float(d.get("leverage", 0)) if action in ("LONG", "SHORT") else 0.0
+    except (KeyError, TypeError, ValueError) as e:
+        raise LLMError(f"數值欄位缺漏或格式錯誤:{e!r}") from e
+    if not 0 <= conf <= 1:
+        raise LLMError(f"confidence 超出 0~1:{conf}")
+    if action in ("LONG", "SHORT") and not 0 < lev <= MAX_MODEL_LEVERAGE:
+        raise LLMError(f"leverage 需在 (0, {MAX_MODEL_LEVERAGE:g}]:{lev}")
+    reason = d.get("reason")
+    if not isinstance(reason, str):
+        raise LLMError("reason 必須是字串")
+    return FuturesDecision(action, lev, conf, reason.strip()[:500])
+
+
+class RuleFuturesModel:
+    """合約模式的離線基準(不花錢):均線 + MACD 同向時順勢 1 倍,否則空手。"""
+
+    name = "rule"
+
+    def decide(self, system: str, prompt: str, feats: Optional[dict] = None) -> Tuple[FuturesDecision, Dict]:
+        if feats is None:
+            raise LLMError("RuleFuturesModel 需要 feats")
+        meta = {"model": self.name, "latency_s": 0.0, "tokens_in": 0, "tokens_out": 0}
+        up = feats["sma20_vs_price_pct"] < 0 and feats["sma50_vs_price_pct"] < 0 and feats["macd_hist_pct"] > 0
+        down = feats["sma20_vs_price_pct"] > 0 and feats["sma50_vs_price_pct"] > 0 and feats["macd_hist_pct"] < 0
+        if up:
+            return FuturesDecision("LONG", 1.0, 0.7, "價格在 20/50 均線之上且 MACD 為正"), meta
+        if down:
+            return FuturesDecision("SHORT", 1.0, 0.7, "價格在 20/50 均線之下且 MACD 為負"), meta
+        return FuturesDecision("FLAT", 0.0, 0.7, "趨勢不明確,空手"), meta

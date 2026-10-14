@@ -10,11 +10,13 @@
   - **目標持倉模式**(`once` / `paper` / `replay`):AI 每根 K 線決定要持有多少比例的幣,交易次數少。
   - **AI 調整網格模式**(`grid` / `grid-replay`):AI 每根 K 線決定網格區間與格數(或暫停),
     網格每幾秒撮合一次,負責頻繁的小額低買高賣。AI 費用和目標持倉模式一樣,成交次數多很多。
+  - **合約模式**(`futures` / `futures-replay`):USDT 永續合約,AI 決定做多 / 做空 / 空手與槓桿;
+    模擬強平、停損、資金費。**只模擬,不下真單。**
 
 ## 技術棧
 - Python 3.9+,**僅用標準庫**(`urllib`、`json`、`unittest`),無第三方依賴
 - AI:Gemini API `generateContent`(REST,JSON 結構化輸出)
-- 行情:Binance 公開 API(免金鑰)
+- 行情:Binance 公開 API(現貨與 USDT 永續合約,免金鑰)
 
 ## 安裝與環境設定
 
@@ -61,6 +63,12 @@ python3 -m aitrader grid-replay --model rule --limit 1000 --every 1
 
 # 8. 檢視網格日誌(report 會自動辨識)
 python3 -m aitrader report journal/grid_BTCUSDT_gemini.jsonl
+
+# 9. 合約模擬盤(AI 多空,預設槓桿上限 2 倍)
+python3 -m aitrader futures
+
+# 10. 合約歷史回放(含歷史資金費;先用規則模型看看)
+python3 -m aitrader futures-replay --model rule --limit 1000 --every 1
 ```
 
 ### 子指令
@@ -73,6 +81,8 @@ python3 -m aitrader report journal/grid_BTCUSDT_gemini.jsonl
 | `report` | 統計決策日誌:各種決策次數、成交、已實現損益、手續費、被風控擋下的原因、token 用量、最近決策與理由。網格日誌會自動改用網格報表。 |
 | `grid` | AI 調整網格的模擬盤,說明見下方「AI 調整網格模式」。 |
 | `grid-replay` | AI 調整網格的歷史回放。 |
+| `futures` | 合約模擬盤,說明見下方「合約模式」。 |
+| `futures-replay` | 合約歷史回放。 |
 
 ### 共用參數
 
@@ -150,6 +160,35 @@ python3 -m aitrader grid --no-learn    # 對照組(另開一個終端機)
 另有 `--state`、`--journal`、`--reset`、`--max-steps`(`grid`)與 `--limit`、`--every`、`--max-calls`、`--cache-dir`(`grid-replay`),意義同上。
 回放時 K 線內部走勢未知,以保守路徑(陽線先探低、陰線先拉高)撮合,成交次數會比實際少。
 
+## 合約模式
+
+USDT 永續合約、單向持倉、全倉保證金。**只模擬,不下真單**;槓桿會放大虧損,請先用模擬盤驗證。
+
+- 每根 `--interval` K 線收盤後問 AI:`LONG` / `SHORT`(附目標槓桿)、`FLAT`(平倉空手)、`HOLD`(維持)。
+  已有持倉時可加減倉或直接反手。
+- 每 `--check-every` 秒(預設 30)以**標記價格**檢查強制規則,依「價格先碰到哪個」:
+  - **停損**:持倉虧損達錢包 `--stop-loss`%(預設 3)平倉。
+  - **單日虧損上限**:權益較當日(UTC)開始跌 `--daily-loss-limit`%(預設 5),平倉並停到隔天、不問 AI。
+  - **強平**:權益低於維持保證金(名目價值 × 0.5%)時以強平價強制平倉,另扣 0.5% 清算費。
+    價格跳空越過強平價時一律以強平處理(交易所會先強平)。強平後當日停機;權益低於初始 1% 視為爆倉並結束。
+- **資金費**:每次結算(通常每 8 小時)依結算前的費率收付:費率為正時多方付、空方收。
+- 回放使用合約 K 線與歷史資金費率;K 線內部以保守路徑檢查停損 / 強平。
+
+| 參數 | 預設 | 說明 |
+|---|---|---|
+| `--max-leverage` | 2 | 槓桿上限(最多 10),AI 要求更高會被截斷 |
+| `--min-confidence` | 0.6 | AI 信心低於此值不交易 |
+| `--min-change` | 20 | 同方向調整的曝險差距小於此 % 不交易(100 = 1 倍) |
+| `--stop-loss` | 3 | 持倉虧損達錢包此 % 平倉 |
+| `--daily-loss-limit` | 5 | 權益單日下跌達此 % 平倉並停到隔天 |
+| `--max-trades` | 6 | 每日最多成交筆數(不含強制出場) |
+| `--fee` | 0.0005 | 單邊手續費率(合約吃單) |
+| `--slippage-bps` | 2 | 滑價(基點) |
+| `--cash` | 10000 | 模擬保證金(USDT) |
+
+簡化與限制:維持保證金率固定(實際依倉位級距調整)、不模擬委託簿深度與插針;資金費以結算前最後看到的預估費率計算,
+程式停機期間錯過的結算不計。
+
 ## 運作方式(目標持倉模式)
 
 每個決策點:
@@ -179,10 +218,13 @@ aitrader/
   grid_agent.py AI 調整網格:風控、套用 AI 決策、歷史回放
   grid_cli.py   grid / grid-replay 指令與網格報表
   memory.py     學習紀錄:最近決策的結果、每日檢討的待檢資料與心得
+  futures.py    合約帳戶(多空、槓桿、強平價、資金費)
+  futures_agent.py 合約風控(強平 / 停損 / 單日上限)、AI 決策過濾、回放
+  futures_cli.py futures / futures-replay 指令與合約報表
   runtime.py    安全停止(訊號)與可中斷等待
   state.py      狀態原子寫入、檔案鎖、決策日誌
   cli.py        命令列入口(python3 -m aitrader)
-tests/          單元測試(Gemini 以模擬 HTTP 回應測試,不需金鑰;test_grid.py 為網格模式)
+tests/          單元測試(Gemini 以模擬 HTTP 回應測試,不需金鑰;test_grid.py 網格、test_futures.py 合約)
 state/ journal/ cache/   執行時產生(已 gitignore)
 doc/            過程文件
 ```

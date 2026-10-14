@@ -85,3 +85,34 @@ Respond with JSON only."""
 def build_reflection_prompt(symbol: str, review: dict, lessons: list) -> str:
     payload = {"symbol": symbol, "day_review": review, "current_lessons": lessons}
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+# ---------------- 合約模式 ----------------
+
+FUTURES_SYSTEM = """You are a cautious trader managing a USDT-margined PERPETUAL FUTURES account in PAPER TRADING (no real money).
+You can go LONG or SHORT with leverage up to the stated max_leverage. Each turn you receive technical features of the latest CLOSED candles,
+the current position and the funding rate, and choose ONE action:
+- LONG / SHORT: hold a long / short position with the given `leverage` (position notional / equity, e.g. 1.0 = no extra leverage).
+  If already positioned, this sets the new target (can add, reduce, or flip direction).
+- FLAT: close any position and stay in cash.
+- HOLD: keep the current position unchanged (default when signals are mixed).
+Guidelines:
+- Leverage magnifies losses; a forced stop-loss and liquidation exist. Use lower leverage when volatility (ATR) is high.
+- Prefer FLAT or HOLD when the trend is unclear. Every trade costs fees; avoid churning.
+- Funding: when funding_rate_per_8h is positive, longs pay shorts every 8 hours (and vice versa). It matters for long holding periods.
+- confidence reflects strength of evidence (0-1). Base the decision ONLY on the provided data. For FLAT / HOLD set leverage to 0.
+- Write `reason` in Traditional Chinese, concise (<= 200 characters).
+Respond with JSON only."""
+
+
+def build_futures_prompt(symbol: str, interval: str, feats: dict, position: dict, funding_rate: Optional[float],
+                         constraints: dict) -> str:
+    payload = {
+        "symbol": symbol,
+        "candle_interval": interval,
+        "features": feats,
+        "position": position,
+        "funding_rate_per_8h": funding_rate,
+        "constraints": constraints,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

@@ -215,6 +215,9 @@ def cmd_report(a) -> int:
     if any(str(r.get("kind", "")).startswith("grid") for r in recs):
         from .grid_cli import report_grid
         return report_grid(a.journal, recs)
+    if any(str(r.get("kind", "")).startswith("futures") for r in recs):
+        from .futures_cli import report_futures
+        return report_futures(a.journal, recs)
     decided = [r for r in recs if r.get("decision")]
     actions = Counter(r["decision"]["action"] for r in decided)
     trades = [r["trade"] for r in recs if r.get("trade")]
@@ -307,8 +310,10 @@ def main(argv=None) -> int:
 
     from .grid_cli import add_parsers as add_grid_parsers  # 延遲載入,避免循環匯入
     add_grid_parsers(sub)
+    from .futures_cli import add_parsers as add_futures_parsers
+    add_futures_parsers(sub)
 
-    p = sub.add_parser("report", help="檢視決策日誌(一般模式與網格模式皆可)")
+    p = sub.add_parser("report", help="檢視決策日誌(一般、網格、合約模式皆可)")
     p.add_argument("journal", help="日誌路徑,如 journal/paper_BTCUSDT_gemini.jsonl")
     p.set_defaults(fn=cmd_report)
 
