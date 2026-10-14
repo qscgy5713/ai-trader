@@ -167,12 +167,12 @@ class FuturesAgent:
             self.halted_day = self.day
         else:
             px = p if continuous else price
-            t = a.rebalance(0, px, ts, code)
             if code == "stop_loss":
                 why = f"持倉虧損達錢包 {self.pos_stop_pct:.2f}%,停損平倉"
             else:
                 why = "權益觸及今日虧損上限,平倉並停止交易至明天(UTC)"
                 self.halted_day = self.day
+            t = a.rebalance(0, px, ts, why)  # 原因寫中文,畫面「最近成交」直接顯示
         self.memory.on_tick(0, code)
         rec.update(forced=True, action_taken=why, code=code, trade=asdict(t) if t else None)
         return self._finish(rec, price, journal)

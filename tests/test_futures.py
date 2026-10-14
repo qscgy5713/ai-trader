@@ -160,6 +160,7 @@ class AgentTest(unittest.TestCase):
         r = a.check(stop - 1, TS + 2, prev=stop + 0.5)  # 連續走勢穿越:以停損價出場
         self.assertEqual(r["code"], "stop_loss")
         self.assertAlmostEqual(r["trade"]["price"], stop)
+        self.assertIn("停損", r["trade"]["reason"])
         b = self.agent(stop_loss_pct=3, daily_loss_limit_pct=50)
         b.decide(SeqModel(D("SHORT", 2)), "X", "1h", cs, 100, TS)
         r = b.check(110, TS + 1)  # 輪詢 / 跳空:以當下價格出場
@@ -427,3 +428,32 @@ class StyleTest(unittest.TestCase):
         self.assertEqual(_risk_cfg(ap.parse_args(["--style", "conservative"]), Money()).min_confidence, 0.6)
         self.assertEqual(_risk_cfg(ap.parse_args(["--style", "aggressive", "--min-confidence", "0.7"]),
                                    Money()).min_confidence, 0.7)
+
+
+class DisplayTest(unittest.TestCase):
+    def test_counters_survive_trade_trim_and_old_state(self):
+        a = acct()
+        for i in range(600):
+            a.rebalance(100 if i % 2 == 0 else 0, 100 + i % 3, TS + i)
+        self.assertEqual(len(a.trades), 500)
+        self.assertEqual(a.trade_count, 600)
+        d = json.loads(json.dumps(a.to_dict()))
+        self.assertEqual(FuturesAccount.from_dict(d).trade_count, 600)
+        del d["trade_count"], d["realized_total"]
+        self.assertEqual(FuturesAccount.from_dict(d).trade_count, 500)
+
+    def test_paper_shows_summary_and_recent_trades_on_resume(self):
+        from aitrader.cli import main
+        ft = FakeTime()
+        with tempfile.TemporaryDirectory() as t, \
+                mock.patch("aitrader.futures_cli.fetch_klines", return_value=candles()), \
+                mock.patch("aitrader.futures_cli.fetch_premium", return_value=(100.0, 0.0, ft.now + 10 ** 6)), \
+                mock.patch("aitrader.futures_cli.time", ft), \
+                mock.patch("aitrader.futures_cli._make_model", return_value=SeqModel(D("LONG", 1))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            args = ["futures", "--state", os.path.join(t, "s.json"), "--journal", os.path.join(t, "j.jsonl"),
+                    "--max-steps", "1"]
+            self.assertEqual(main(args), 0)
+            self.assertIn("累計:成交 1 筆", out.getvalue())
+            self.assertEqual(main(args), 0)  # 接續:啟動時列出最近成交
+            self.assertIn("最近 1 筆成交", out.getvalue())

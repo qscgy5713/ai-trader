@@ -77,6 +77,28 @@ def _fmt_pos(agent: FuturesAgent, price: float, money: Money) -> str:
             f"{stop}{liq}" + tail)
 
 
+def _fmt_summary(agent: FuturesAgent, price: float, money: Money) -> str:
+    """累計成績(一行)。"""
+    a = agent.acct
+    eq = a.equity(price)
+    return (f"累計:成交 {a.trade_count} 筆  已實現 {money.fmt(a.realized_total, sign=True)}  "
+            f"手續費 {money.fmt(a.fees_paid)}  資金費淨支付 {money.fmt(a.funding_paid, sign=True)}  "
+            f"報酬 {(eq / a.initial - 1) * 100:+.2f}%")
+
+
+def _fmt_trades(agent: FuturesAgent, money: Money, n: int = 5) -> str:
+    """最近 n 筆成交(多行);沒有則回空字串。"""
+    ts = agent.acct.trades[-n:]
+    if not ts:
+        return ""
+    lines = [f"[futures] 最近 {len(ts)} 筆成交:"]
+    for t in ts:
+        side = "買" if t.side == "buy" else "賣"
+        pnl = f"  實現 {money.fmt(t.realized_pnl, sign=True)}" if t.realized_pnl else ""
+        lines.append(f"  {_hm(t.ts)} {side} {t.qty:.6f} @ {t.price:,.2f}  手續費 {money.fmt(t.fee)}{pnl}  {t.reason[:40]}")
+    return "\n".join(lines)
+
+
 def _fmt_rec(rec: dict) -> str:
     d = rec.get("decision")
     if d:
@@ -129,6 +151,13 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
         print(f"[futures] 新帳戶:{a.symbol} 模擬保證金 {money.fmt(agent.acct.initial)},"
               f"模型 {getattr(model, 'name', a.model)}")
     print(f"[futures] {_risk_line(a, rc, money)}")
+    if agent.acct.trade_count:
+        try:
+            p0 = fetch_premium(a.symbol)[0]
+            print(f"[futures] {_fmt_pos(agent, p0, money)}\n[futures] {_fmt_summary(agent, p0, money)}")
+        except OSError:
+            pass
+        print(_fmt_trades(agent, money))
     if not a.no_learn and getattr(model, "can_reflect", False):
         print(f"[futures] 學習:每次決策附上最近的結果;每天(UTC 換日)檢討一次並更新心得(目前 {len(agent.memory.lessons)} 條)")
     print(f"[futures] 每根 {a.interval} K 線收盤後問 AI;每 {a.check_every:g} 秒檢查強平 / 停損與資金費;"
@@ -158,16 +187,16 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
                 rate, next_funding = new_rate, nft
                 r = agent.check(price, now, journal=journal)
                 if r:
-                    print(f"[futures] {_hm(now)} 標記價 {price}  " + _fmt_rec(r) + f"\n    {_fmt_pos(agent, price, money)}",
-                          flush=True)
+                    print(f"[futures] {_hm(now)} 標記價 {price}  " + _fmt_rec(r) + f"\n    {_fmt_pos(agent, price, money)}"
+                          f"\n    {_fmt_summary(agent, price, money)}", flush=True)
                 bar_close = (now // secs) * secs
                 if bar_close > last_bar and now >= retry_at:
                     candles = fetch_klines(a.symbol, a.interval, FETCH_BARS, futures=True)
                     rec = agent.decide(model, a.symbol, a.interval, candles, price, now, rate, journal)
                     if rec.get("reflection"):
                         print(f"[futures] {_hm(now)} " + format_reflection(rec["reflection"]), flush=True)
-                    print(f"[futures] {_hm(now)} 標記價 {price}  " + _fmt_rec(rec) + f"\n    {_fmt_pos(agent, price, money)}",
-                          flush=True)
+                    print(f"[futures] {_hm(now)} 標記價 {price}  " + _fmt_rec(rec) + f"\n    {_fmt_pos(agent, price, money)}"
+                          f"\n    {_fmt_summary(agent, price, money)}", flush=True)
                     if rec.get("error") and attempts + 1 < BAR_RETRIES:
                         attempts += 1
                         retry_at = now + RETRY_DELAY
@@ -195,8 +224,7 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
     save()
     try:
         price = fetch_premium(a.symbol)[0]
-        eq = agent.acct.equity(price)
-        print(f"\n[futures] 結束:{_fmt_pos(agent, price, money)}  報酬 {(eq / agent.acct.initial - 1) * 100:+.2f}%")
+        print(f"\n[futures] 結束:{_fmt_pos(agent, price, money)}\n[futures] {_fmt_summary(agent, price, money)}")
     except OSError:
         print("\n[futures] 結束(無法取得現價)")
     return 0

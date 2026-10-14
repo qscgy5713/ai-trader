@@ -45,7 +45,9 @@ class FuturesAccount:
         self.funding_paid = 0.0  # 累計支付的資金費(負值 = 收到)
         self.fees_paid = 0.0
         self.liquidated = False  # 曾被強平(帳戶可能已接近歸零)
-        self.trades: List[FTrade] = []
+        self.trades: List[FTrade] = []  # 只保留最近 500 筆;累計數字看下面兩個計數
+        self.trade_count = 0
+        self.realized_total = 0.0  # 累計已實現損益(未扣手續費與資金費)
 
     # ---- 查詢 ----
     def upnl(self, price: float) -> float:
@@ -113,9 +115,14 @@ class FuturesAccount:
         self.wallet += realized - fee
         self.fees_paid += fee
         t = FTrade(ts, "buy" if delta > 0 else "sell", px, abs(delta), fee, realized, reason)
+        self._record(t)
+        return t
+
+    def _record(self, t: FTrade) -> None:
         self.trades.append(t)
         del self.trades[:-500]
-        return t
+        self.trade_count += 1
+        self.realized_total += t.realized_pnl
 
     def liquidate(self, price: float, ts: float) -> FTrade:
         """強制平倉:以 price 平倉並扣清算費;錢包不會低於 0(虧損超過保證金視為由保險基金承擔)。"""
@@ -128,7 +135,7 @@ class FuturesAccount:
         self.fees_paid += fee
         self.liquidated = True
         t = FTrade(ts, "sell" if q > 0 else "buy", price, abs(q), fee, realized, "強制平倉")
-        self.trades.append(t)
+        self._record(t)
         return t
 
     def apply_funding(self, rate: float, price: float) -> float:
@@ -143,6 +150,7 @@ class FuturesAccount:
         return {"initial": self.initial, "wallet": self.wallet, "qty": self.qty, "entry": self.entry,
                 "fee_rate": self.fee_rate, "slippage_bps": self.slip * 10000, "mmr": self.mmr, "liq_fee": self.liq_fee,
                 "funding_paid": self.funding_paid, "fees_paid": self.fees_paid, "liquidated": self.liquidated,
+                "trade_count": self.trade_count, "realized_total": self.realized_total,
                 "trades": [asdict(t) for t in self.trades[-500:]]}
 
     @classmethod
@@ -154,6 +162,9 @@ class FuturesAccount:
             a.funding_paid, a.fees_paid = float(d["funding_paid"]), float(d["fees_paid"])
             a.liquidated = bool(d["liquidated"])
             a.trades = [FTrade(**t) for t in d["trades"]]
+            # 舊版狀態檔沒有累計欄位:以保留的成交紀錄估計
+            a.trade_count = int(d.get("trade_count", len(a.trades)))
+            a.realized_total = float(d.get("realized_total", sum(t.realized_pnl for t in a.trades)))
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(f"合約帳戶狀態格式錯誤:{e!r}") from e
         if not all(math.isfinite(x) for x in (a.wallet, a.qty, a.entry)) or a.wallet < 0 or a.entry < 0:
