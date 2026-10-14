@@ -18,6 +18,7 @@ from .state import acquire_lock, load_json, save_json
 
 INTERVAL_SECS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 FETCH_BARS = 120  # 每次決策抓的 K 線數(>= MIN_BARS)
+BAR_RETRIES = 3  # 模型暫時失敗時,同一根 K 線最多重試幾次(間隔 --check-every)
 
 
 def _make_model(name: str, cache: bool = False, cache_dir: str = "cache"):
@@ -63,7 +64,7 @@ def cmd_once(a) -> int:
     if rec.get("meta"):
         m = rec["meta"]
         print(f"    模型 {m['model']}  延遲 {m['latency_s']}s  tokens 輸入 {m['tokens_in']} / 輸出 {m['tokens_out']}")
-    return 0
+    return 1 if rec.get("error") else 0  # 模型沒給出有效決策:回傳非 0,方便腳本判斷
 
 
 # ------------------------------ replay ------------------------------
@@ -170,7 +171,12 @@ def _paper_loop(a, rc: RiskConfig, model, path: str, journal: str, stop: _StopFl
 
     save(last_bar)
     secs = INTERVAL_SECS[a.interval]
+    if (time.time() // secs) * secs <= last_bar:  # 這根 K 線已決策過(接續時常見)
+        nxt = last_bar + secs
+        print(f"[paper] 目前這根 K 線已決策過,下一次問模型約在 {time.strftime('%H:%M', time.localtime(nxt))};"
+              "期間每分鐘檢查停損,畫面安靜是正常的", flush=True)
     steps = 0
+    attempts = 0  # 這根 K 線已失敗幾次
     try:
         while not stop.requested:
             now = time.time()
@@ -180,9 +186,17 @@ def _paper_loop(a, rc: RiskConfig, model, path: str, journal: str, stop: _StopFl
                     candles = fetch_klines(a.symbol, a.interval, FETCH_BARS)
                     price = fetch_price(a.symbol)
                     rec = step(model, a.symbol, a.interval, candles, price, now, pf, risk, True, journal)
-                    last_bar = bar_close
-                    steps += 1
                     print(f"[paper] {time.strftime('%m-%d %H:%M')} 現價 {price}  " + _fmt_decision(rec), flush=True)
+                    if rec.get("error") and attempts + 1 < BAR_RETRIES:  # 暫時失敗:不跳過這根,稍後重試
+                        attempts += 1
+                        print(f"[paper] 這根 K 線第 {attempts} 次失敗,{a.check_every:g} 秒後重試", flush=True)
+                    else:
+                        if rec.get("error"):
+                            print(f"[paper] 這根 K 線已失敗 {BAR_RETRIES} 次,放棄並等下一根", flush=True)
+                        last_bar, attempts = bar_close, 0
+                        steps += 1
+                        nxt = bar_close + secs
+                        print(f"[paper] 下一次問模型約在 {time.strftime('%H:%M', time.localtime(nxt))}", flush=True)
                 else:  # 兩根之間:只檢查強制規則(停損等),不花模型費用
                     price = fetch_price(a.symbol)
                     rec = step(model, a.symbol, a.interval, [], price, now, pf, risk, False, journal)
@@ -235,8 +249,9 @@ def cmd_report(a) -> int:
     tok_out = sum((r.get("meta") or {}).get("tokens_out", 0) for r in recs)
     print(f"日誌 {a.journal}:{len(recs)} 筆紀錄({time.strftime('%m-%d %H:%M', time.localtime(recs[0]['ts']))} ~ "
           f"{time.strftime('%m-%d %H:%M', time.localtime(recs[-1]['ts']))})")
-    print(f"模型決策 {len(decided)} 次:" + "、".join(f"{k} {v}" for k, v in actions.most_common())
-          + f";模型錯誤 {sum(1 for r in recs if r.get('error'))} 次;強制出場 {sum(1 for r in recs if r.get('forced'))} 次")
+    errors = [r for r in recs if r.get("error")]
+    detail = ("(" + "、".join(f"{k} {v}" for k, v in actions.most_common()) + ")") if actions else ""
+    print(f"模型決策 {len(decided)} 次{detail};模型錯誤 {len(errors)} 次;強制出場 {sum(1 for r in recs if r.get('forced'))} 次")
     print(f"成交 {len(trades)} 筆,已實現損益 {realized:+.2f},手續費 {fees:.2f}")
     print(f"最後權益 {recs[-1]['equity_after']:.2f}  持倉 {recs[-1]['position_pct_after']:.1f}%")
     if tok_in or tok_out:
@@ -253,6 +268,13 @@ def cmd_report(a) -> int:
     if forced:
         names = {"stop_loss": "停損", "take_profit": "停利", "daily_loss": "單日虧損上限", "halted": "停機清倉"}
         print("強制出場:" + "、".join(f"{names.get(k, k)} {v} 次" for k, v in forced.most_common()))
+    if errors:
+        print("最近的模型錯誤:")
+        for r in errors[-3:]:
+            print(f"  {time.strftime('%m-%d %H:%M', time.localtime(r['ts']))} {r['error'][:100]}")
+    if not decided:
+        print("還沒有任何有效的模型決策")
+        return 0
     print("最近 5 次決策:")
     for r in decided[-5:]:
         d = r["decision"]

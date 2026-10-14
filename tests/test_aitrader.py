@@ -170,7 +170,7 @@ class GeminiTest(unittest.TestCase):
                 self.m.decide("S", "P")
 
     def test_config_errors_not_retried_and_no_key_leak(self):
-        for code in (400, 401, 403, 404):
+        for code in (400, 401, 402, 403, 404):  # 402 = 額度用完(帳務),同樣不重試、直接停
             with mock.patch("aitrader.llm.urllib.request.urlopen", side_effect=_http_error(code, "API key not valid")) as u:
                 with self.assertRaises(LLMConfigError) as cm:
                     self.m.decide("S", "P")
@@ -378,6 +378,46 @@ class CliTest(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(main(["once"]), 2)
         self.assertIn("GEMINI_API_KEY", err.getvalue())
+
+    def test_paper_retries_same_bar_after_model_error(self):
+        from aitrader.cli import main
+
+        class Flaky(FakeModel):
+            def decide(self, system, prompt, feats=None):
+                self.calls.append(prompt)
+                if len(self.calls) <= 2:
+                    raise LLMError("暫時失敗")
+                return Decision("BUY", 30, 0.9, "ok"), {"model": "f", "latency_s": 0, "tokens_in": 0, "tokens_out": 0}
+
+        m = Flaky()
+        with tempfile.TemporaryDirectory() as t, self._patch_market(), mock.patch("aitrader.cli._make_model", return_value=m), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            j = os.path.join(t, "j.jsonl")
+            rc = main(["paper", "--state", os.path.join(t, "s.json"), "--journal", j, "--max-steps", "1"])
+            with open(j) as fh:
+                codes = [json.loads(l)["code"] for l in fh]
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(m.calls), 3)  # 同一根 K 線重試到成功,而不是等下一根
+        self.assertEqual(codes, ["no_decision", "no_decision", "execute"])
+        self.assertIn("後重試", out.getvalue())
+
+    def test_report_without_decisions_shows_errors(self):
+        from aitrader.cli import main
+        with tempfile.TemporaryDirectory() as t:
+            j = os.path.join(t, "j.jsonl")
+            with open(j, "w") as fh:
+                fh.write(json.dumps({"ts": 0, "error": "Gemini API 402:depleted", "code": "no_decision", "decision": None,
+                                     "trade": None, "equity_after": 10000, "position_pct_after": 0}) + "\n")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(main(["report", j]), 0)
+        self.assertIn("402", out.getvalue())
+        self.assertIn("還沒有任何有效的模型決策", out.getvalue())
+
+    def test_once_exit_code_reflects_model_error(self):
+        from aitrader.cli import main
+        with self._patch_market(), mock.patch("aitrader.cli._make_model", return_value=FakeModel(exc=LLMError("x"))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["once"]), 1)
 
     def test_help_renders(self):
         from aitrader.cli import main

@@ -24,7 +24,7 @@ class LLMError(Exception):
 
 
 class LLMConfigError(LLMError):
-    """設定錯誤(金鑰無效、模型不存在、請求格式錯);重試無用,應停下來讓使用者處理。"""
+    """設定 / 帳務錯誤(金鑰無效、模型不存在、請求格式錯、額度用完);重試無用,應停下來讓使用者處理。"""
 
 
 @dataclass
@@ -106,6 +106,8 @@ class GeminiModel:
                     time.sleep(min(wait, 60) + random.uniform(0, 0.5))
                     delay *= 2
                     continue
+                if e.code == 402:  # 額度 / 帳務問題:重試無用,必須由使用者處理
+                    raise LLMConfigError(f"Gemini API 402 帳務問題:{detail}") from None
                 if e.code in (400, 401, 403, 404):
                     raise LLMConfigError(f"Gemini API {e.code}:{detail}(請檢查金鑰、模型名稱 {self.model})") from None
                 raise LLMError(f"Gemini API {e.code}:{detail}") from None
