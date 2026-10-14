@@ -98,6 +98,11 @@ the current position and the funding rate, and choose ONE action:
 - HOLD: keep the current position unchanged (default when signals are mixed).
 Guidelines:
 - Leverage magnifies losses; a forced stop-loss and liquidation exist. Use lower leverage when volatility (ATR) is high.
+- `constraints.max_leverage_now` already reflects today's remaining loss budget (it shrinks after losses); never exceed it.
+  The stop-loss of a new position is `stop_loss_pct_of_wallet_for_new_position` of the wallet, so higher leverage = tighter stop in price terms.
+- If `memory` is present: `recent_decisions_with_outcomes` shows what your recent choices led to (until the next decision),
+  and `lessons_from_daily_reviews` are notes from your own past reviews. Use them to avoid repeating mistakes,
+  but single outcomes are noisy; do not overreact to one result.
 - Prefer FLAT or HOLD when the trend is unclear. Every trade costs fees; avoid churning.
 - Funding: when funding_rate_per_8h is positive, longs pay shorts every 8 hours (and vice versa). It matters for long holding periods.
 - confidence reflects strength of evidence (0-1). Base the decision ONLY on the provided data. For FLAT / HOLD set leverage to 0.
@@ -106,7 +111,7 @@ Respond with JSON only."""
 
 
 def build_futures_prompt(symbol: str, interval: str, feats: dict, position: dict, funding_rate: Optional[float],
-                         constraints: dict) -> str:
+                         constraints: dict, memory: Optional[dict] = None) -> str:
     payload = {
         "symbol": symbol,
         "candle_interval": interval,
@@ -115,4 +120,18 @@ def build_futures_prompt(symbol: str, interval: str, feats: dict, position: dict
         "funding_rate_per_8h": funding_rate,
         "constraints": constraints,
     }
+    if memory is not None:
+        payload["memory"] = memory
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+FUTURES_REFLECTION_SYSTEM = """You review yesterday's decisions of an AI-managed PERPETUAL FUTURES account (paper trading, long/short with leverage).
+You receive the day's results (equity change, fees + funding as % of equity, forced exits such as stop_loss / daily_loss / liquidation)
+and every decision (LONG / SHORT with leverage, FLAT, HOLD; what actually happened; the position afterwards; and the outcome until
+the next decision: price change, equity change, forced exits), plus your current lessons.
+Task: write a short summary of the day, and return an UPDATED full list of at most 5 lessons that would improve future decisions.
+- Lessons must be concrete and actionable (e.g. when direction calls were wrong, leverage vs volatility, flipping too often, holding through funding).
+- Keep earlier lessons that still hold; revise or drop ones contradicted by evidence. Fewer, better lessons are preferred.
+- One day is a small sample: do not draw strong conclusions from a single event; say so when evidence is weak.
+- Only rely on the data provided. Write in Traditional Chinese.
+Respond with JSON only."""

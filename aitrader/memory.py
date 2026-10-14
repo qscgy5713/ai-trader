@@ -11,7 +11,9 @@ from __future__ import annotations
 import time
 from typing import List, Optional
 
-from .llm import MAX_LESSONS
+from .llm import MAX_LESSONS, LLMConfigError, LLMError
+from .prompt import build_reflection_prompt
+from .state import append_jsonl
 
 HISTORY_LEN = 8  # 決策時附上最近幾次的結果
 MAX_DAY_LOG = 48  # 一天最多保留幾筆給檢討(防止短週期時提示詞過長)
@@ -23,7 +25,10 @@ def _utc(ts: float) -> str:
 
 
 class LearningMemory:
-    def __init__(self) -> None:
+    """fill_label:結果裡「成交筆數」欄位的名稱(網格為 grid_fills);None 表示不記成交筆數(合約模式)。"""
+
+    def __init__(self, fill_label: Optional[str] = "grid_fills") -> None:
+        self.fill_label = fill_label
         self.history: List[dict] = []  # 已有結果的最近決策
         self.day_log: List[dict] = []  # 今天已有結果的決策(給明天檢討)
         self.pending: Optional[dict] = None  # 最近一次決策,結果尚未結算
@@ -31,7 +36,7 @@ class LearningMemory:
         self.lessons_updated = ""  # 最近一次檢討的日期
         self.review: Optional[dict] = None  # 等待檢討的前一天資料
         self.review_attempts = 0
-        self.grid_fills = 0  # 累計網格掛單成交筆數
+        self.grid_fills = 0  # 累計成交筆數(網格掛單)
         self.day_fills0 = 0  # 當日開始時的 grid_fills
         self.day_events: List[str] = []
 
@@ -43,14 +48,15 @@ class LearningMemory:
             if self.pending is not None:
                 self.pending["events"].append(event)
 
-    def record_decision(self, ts: float, price: float, equity: float, decision: Optional[dict], code: str) -> None:
-        """記錄一次決策點(問了模型才記;停機中不記)。結果在下一次決策或換日時結算。"""
+    def record_decision(self, ts: float, price: float, equity: float, decision: Optional[dict], code: str,
+                        params: Optional[str] = None, extra: Optional[dict] = None) -> None:
+        """記錄一次決策點(問了模型才記;停機中不記)。結果在下一次決策或換日時結算。
+        params:決策參數的精簡描述;extra:其他要一併給模型看的欄位(如決策後的持倉)。"""
         d = decision or {}
-        params = (f"-{d['lower_pct']:g}%/+{d['upper_pct']:g}% {d['grids']} grids"
-                  if d.get("action") == "SET" else None)
         self.pending = {"time_utc": _utc(ts), "action": d.get("action", "ERROR"), "params": params,
                         "confidence": d.get("confidence"), "result": code, "reason": (d.get("reason") or "")[:80],
-                        "events": [], "_ts": ts, "_price": price, "_equity": equity, "_fills": self.grid_fills}
+                        **(extra or {}), "events": [], "_ts": ts, "_price": price, "_equity": equity,
+                        "_fills": self.grid_fills}
 
     def settle(self, ts: float, price: float, equity: float) -> None:
         """結算最近一次決策的結果。"""
@@ -62,8 +68,9 @@ class LearningMemory:
             "hours": round((ts - p["_ts"]) / 3600, 1),
             "price_change_pct": round((price / p["_price"] - 1) * 100, 2),
             "equity_change_pct": round((equity / p["_equity"] - 1) * 100, 3) if p["_equity"] else 0.0,
-            "grid_fills": self.grid_fills - p["_fills"],
         }
+        if self.fill_label:
+            entry["outcome"][self.fill_label] = self.grid_fills - p["_fills"]
         self.history = (self.history + [entry])[-HISTORY_LEN:]
         self.day_log = (self.day_log + [entry])[-MAX_DAY_LOG:]
         self.pending = None
@@ -76,11 +83,12 @@ class LearningMemory:
             self.review = {
                 "day_utc": old_day,
                 "equity_change_pct": round((equity / day_start_equity - 1) * 100, 3) if day_start_equity else 0.0,
-                "grid_fills": self.grid_fills - self.day_fills0,
                 "fees_pct_of_equity": round(fees_today / day_start_equity * 100, 3) if day_start_equity else 0.0,
                 "forced_exits": list(self.day_events),
                 "decisions": list(self.day_log),
             }
+            if self.fill_label:
+                self.review[self.fill_label] = self.grid_fills - self.day_fills0
             self.review_attempts = 0
         self.day_log, self.day_events, self.day_fills0 = [], [], self.grid_fills
 
@@ -109,8 +117,8 @@ class LearningMemory:
                                               "review_attempts", "grid_fills", "day_fills0", "day_events")}
 
     @classmethod
-    def from_dict(cls, d: Optional[dict]) -> "LearningMemory":
-        m = cls()
+    def from_dict(cls, d: Optional[dict], fill_label: Optional[str] = "grid_fills") -> "LearningMemory":
+        m = cls(fill_label)
         if not d:
             return m  # 舊版狀態檔沒有學習紀錄:從空白開始
         try:
@@ -122,3 +130,35 @@ class LearningMemory:
         except (KeyError, TypeError, ValueError) as ex:
             raise ValueError(f"學習紀錄格式錯誤:{ex!r}") from ex
         return m
+
+
+def daily_reflection(memory: LearningMemory, model, system: str, symbol: str, ts: float,
+                     journal: Optional[str], kind: str) -> Optional[dict]:
+    """有待檢討的前一天資料時,請模型檢討並更新心得;回傳日誌紀錄(沒做則 None)。
+    失敗不影響交易,下次決策再試(最多 MAX_REVIEW_ATTEMPTS 次)。設定錯誤照常往上丟。"""
+    review = memory.review
+    if not (review and getattr(model, "can_reflect", False)):
+        return None
+    rec = {"kind": kind, "ts": ts, "day": review["day_utc"], "summary": None, "lessons": None, "meta": None,
+           "error": None}
+    try:
+        r, meta = model.reflect(system, build_reflection_prompt(symbol, review, memory.lessons))
+        memory.set_lessons(r.lessons, review["day_utc"])
+        rec.update(summary=r.summary, lessons=list(memory.lessons), meta=meta)
+    except LLMConfigError:
+        raise
+    except LLMError as e:
+        memory.review_failed()
+        rec["error"] = str(e)
+    if journal:
+        append_jsonl(journal, rec)
+    return rec
+
+
+def format_reflection(r: dict) -> str:
+    """把每日檢討紀錄整理成給人看的文字。"""
+    if r.get("error"):
+        return f"每日檢討({r['day']})失敗,稍後重試:{r['error']}"
+    lines = [f"每日檢討({r['day']}):{r['summary']}", "    目前心得:"]
+    lines += [f"    {i}. {x}" for i, x in enumerate(r["lessons"], 1)] or ["    (無)"]
+    return "\n".join(lines)

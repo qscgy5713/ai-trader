@@ -216,8 +216,9 @@ def cmd_report(a) -> int:
         from .grid_cli import report_grid
         return report_grid(a.journal, recs)
     if any(str(r.get("kind", "")).startswith("futures") for r in recs):
+        from .currency import make_money
         from .futures_cli import report_futures
-        return report_futures(a.journal, recs)
+        return report_futures(a.journal, recs, make_money(a.currency, a.twd_rate))
     decided = [r for r in recs if r.get("decision")]
     actions = Counter(r["decision"]["action"] for r in decided)
     trades = [r["trade"] for r in recs if r.get("trade")]
@@ -315,6 +316,8 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("report", help="檢視決策日誌(一般、網格、合約模式皆可)")
     p.add_argument("journal", help="日誌路徑,如 journal/paper_BTCUSDT_gemini.jsonl")
+    p.add_argument("--currency", choices=["USDT", "TWD"], default="USDT", help="合約報表的金額幣別(預設 USDT)")
+    p.add_argument("--twd-rate", type=float, help="USDT/TWD 匯率;不指定則從 MAX 取即時匯率")
     p.set_defaults(fn=cmd_report)
 
     a = ap.parse_args(argv)

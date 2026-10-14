@@ -1,8 +1,15 @@
 """合約模式:AI 決定做多 / 做空 / 空手與槓桿,程式強制風控。只模擬。
 
 每個價格檢查點先跑強制規則(優先順序依「價格先碰到哪個」):
-  強平(liquidation)> 停損(持倉虧損達錢包 X%)> 單日虧損上限(權益較當日開始跌 X%,之後當日停機)。
+  強平(liquidation)> 停損(持倉虧損達錢包 X%)> 單日虧損上限(% 或金額,先到者為準;之後當日停機)。
 K 線收盤後問模型,決策再經信心門檻、槓桿上限、最小調整幅度、每日交易次數過濾。
+
+倉位控管(依當日剩餘虧損額度):
+  每筆最多可虧 = min(錢包 × 停損 %, 剩餘額度 × risk_per_trade %),這就是這筆倉位的停損金額;
+  停損距離(價格 %)= 停損金額 / 錢包 / 槓桿,不得小於 min_stop_distance(太近會被正常波動掃掉),
+  因此槓桿上限 = 停損 % / min_stop_distance。今天虧越多,能開的倉位越小。
+
+學習(learn=True):每次決策附上最近決策的結果;UTC 換日後請模型檢討前一天並更新心得(見 memory.py)。
 """
 from __future__ import annotations
 
@@ -15,10 +22,12 @@ from .futures import DUST, FuturesAccount
 from .grid_agent import candle_path
 from .llm import FuturesDecision, LLMConfigError, LLMError
 from .market import MIN_BARS, Candle, features
-from .prompt import FUTURES_SYSTEM, build_futures_prompt
+from .memory import LearningMemory, daily_reflection
+from .prompt import FUTURES_REFLECTION_SYSTEM, FUTURES_SYSTEM, build_futures_prompt
 from .state import append_jsonl
 
 BANKRUPT_PCT = 1.0  # 權益低於初始資金此 % 視為爆倉,停止交易
+MIN_LEVERAGE = 0.1  # 額度限制後可開槓桿低於此值就不開倉
 
 
 @dataclass
@@ -29,6 +38,9 @@ class FuturesRiskConfig:
     stop_loss_pct: float = 3.0  # 持倉虧損達錢包此 % 強制平倉
     daily_loss_limit_pct: float = 5.0  # 權益較當日(UTC)開始下跌達此 % 平倉並停到隔天
     max_trades_per_day: int = 6
+    daily_loss_amount: float = 0.0  # 單日最多虧損金額(USDT);0 = 只用 %。與 % 先到者為準
+    risk_per_trade_pct: float = 50.0  # 每筆倉位停損時最多用掉當日剩餘額度的 %
+    min_stop_distance_pct: float = 0.5  # 停損距離(價格 %)下限
 
     def validate(self) -> None:
         if not 0 < self.max_leverage <= 10:
@@ -43,20 +55,57 @@ class FuturesRiskConfig:
             raise ValueError("daily_loss_limit 需在 (0, 100)")
         if self.max_trades_per_day < 1:
             raise ValueError("max_trades 至少 1")
+        if self.daily_loss_amount < 0:
+            raise ValueError("daily_loss_amount 不可為負")
+        if not 0 < self.risk_per_trade_pct <= 100:
+            raise ValueError("risk_per_trade 需在 (0, 100]")
+        if not 0 < self.min_stop_distance_pct < 50:
+            raise ValueError("min_stop_distance 需在 (0, 50)")
 
 
 class FuturesAgent:
-    def __init__(self, acct: FuturesAccount, cfg: FuturesRiskConfig):
+    def __init__(self, acct: FuturesAccount, cfg: FuturesRiskConfig, learn: bool = True):
         cfg.validate()
         self.acct, self.cfg = acct, cfg
         self.day, self.day_start_equity, self.trades_today = "", acct.wallet, 0
         self.halted_day = ""
+        self.pos_stop_pct = cfg.stop_loss_pct  # 目前倉位的停損(錢包 %),開倉時依剩餘額度決定
+        self.learn = learn
+        self.memory = LearningMemory(fill_label=None)
+        self.day_start_costs = 0.0  # 當日開始時的累計手續費 + 資金費
 
     # ---- 狀態 ----
     def _new_day(self, ts: float, price: float) -> None:
         day = utc_day(ts)
         if day != self.day:
-            self.day, self.day_start_equity, self.trades_today = day, self.acct.equity(price), 0
+            eq, costs = self.acct.equity(price), self._costs()
+            self.memory.roll_day(self.day, ts, price, eq, self.day_start_equity, costs - self.day_start_costs)
+            self.day, self.day_start_equity, self.trades_today = day, eq, 0
+            self.day_start_costs = costs
+
+    def _costs(self) -> float:
+        return self.acct.fees_paid + self.acct.funding_paid
+
+    def day_floor(self) -> float:
+        """當日權益下限:跌到這裡觸發單日虧損上限(% 與金額取較嚴格者)。"""
+        c = self.cfg
+        floor = self.day_start_equity * (1 - c.daily_loss_limit_pct / 100)
+        if c.daily_loss_amount > 0:
+            floor = max(floor, self.day_start_equity - c.daily_loss_amount)
+        return floor
+
+    def budget_left(self, price: float) -> float:
+        """今天還能虧多少(USDT)。"""
+        return max(0.0, self.acct.equity(price) - self.day_floor())
+
+    def sizing(self, price: float) -> Tuple[float, float]:
+        """依剩餘額度決定 (這筆的停損 % of 錢包, 目前可開的槓桿上限)。"""
+        c, w = self.cfg, self.acct.wallet
+        if w <= 0:
+            return 0.0, 0.0
+        risk_amt = min(w * c.stop_loss_pct / 100, self.budget_left(price) * c.risk_per_trade_pct / 100)
+        stop_pct = risk_amt / w * 100
+        return stop_pct, min(c.max_leverage, stop_pct / c.min_stop_distance_pct)
 
     def bankrupt(self, price: float) -> bool:
         return self.acct.equity(price) <= self.acct.initial * BANKRUPT_PCT / 100
@@ -67,7 +116,7 @@ class FuturesAgent:
         info = {"side": side, "leverage": round(abs(a.exposure_pct(price)) / 100, 2),
                 "equity": round(a.equity(price), 2)}
         if side != "FLAT":
-            liq, stop = a.liq_price(), a.stop_price(self.cfg.stop_loss_pct)
+            liq, stop = a.liq_price(), a.stop_price(self.pos_stop_pct)
             info.update(entry_price=round(a.entry, 6),
                         unrealized_pnl_pct_of_wallet=round(-a.position_loss_pct(price), 2),
                         liquidation_price=round(liq, 2) if liq else None,
@@ -82,12 +131,12 @@ class FuturesAgent:
         liq = a.liq_price()
         if liq:
             out.append((liq, "liquidation"))
-        stop = a.stop_price(c.stop_loss_pct)
+        stop = a.stop_price(self.pos_stop_pct)
         if stop:
             out.append((stop, "stop_loss"))
         if self.halted_day != self.day and self.day_start_equity > 0:
-            # equity == 當日開始權益 × (1 - 上限) 的價格
-            p = a.entry + (self.day_start_equity * (1 - c.daily_loss_limit_pct / 100) - a.wallet) / a.qty
+            # equity == 當日權益下限 的價格
+            p = a.entry + (self.day_floor() - a.wallet) / a.qty
             if p > 0:
                 out.append((p, "daily_loss"))
         return out
@@ -119,10 +168,11 @@ class FuturesAgent:
             px = p if continuous else price
             t = a.rebalance(0, px, ts, code)
             if code == "stop_loss":
-                why = f"持倉虧損達錢包 {self.cfg.stop_loss_pct:g}%,停損平倉"
+                why = f"持倉虧損達錢包 {self.pos_stop_pct:.2f}%,停損平倉"
             else:
-                why = f"權益較今日開始下跌 {self.cfg.daily_loss_limit_pct:g}%,平倉並停止交易至明天(UTC)"
+                why = "權益觸及今日虧損上限,平倉並停止交易至明天(UTC)"
                 self.halted_day = self.day
+        self.memory.on_tick(0, code)
         rec.update(forced=True, action_taken=why, code=code, trade=asdict(t) if t else None)
         return self._finish(rec, price, journal)
 
@@ -140,9 +190,12 @@ class FuturesAgent:
     def decide(self, model, symbol: str, interval: str, candles: List[Candle], price: float, ts: float,
                funding_rate: Optional[float] = None, journal: Optional[str] = None) -> dict:
         self._new_day(ts, price)
+        eq0 = self.acct.equity(price)
+        self.memory.settle(ts, price, eq0)
         rec = self._rec(price, ts, getattr(model, "name", "?"))
-        lim = self.day_start_equity * (1 - self.cfg.daily_loss_limit_pct / 100)
-        if self.halted_day != self.day and self.acct.equity(price) <= lim:
+        rec["reflection"] = (daily_reflection(self.memory, model, FUTURES_REFLECTION_SYSTEM, symbol, ts, journal,
+                                              "futures_reflection") if self.learn else None)
+        if self.halted_day != self.day and eq0 <= self.day_floor():
             # 空手時也要檢查(例如同一天連續停損):否則開倉後觸發價已在有利側,會立刻被平倉、白付手續費
             self.halted_day = self.day
         if self.bankrupt(price):
@@ -152,7 +205,7 @@ class FuturesAgent:
         else:
             feats = features(candles)
             prompt = build_futures_prompt(symbol, interval, feats, self.position_info(price), funding_rate,
-                                          self._constraints())
+                                          self._constraints(price), self.memory.prompt_view() if self.learn else None)
             decision = None
             try:
                 decision, meta = model.decide(FUTURES_SYSTEM, prompt, feats)
@@ -162,16 +215,29 @@ class FuturesAgent:
             except LLMError as e:
                 rec["error"] = str(e)
             target, why, code = self._filter(decision, price)
+        stop_pct = self.sizing(price)[0]
         t = self.acct.rebalance(target, price, ts, why) if target is not None else None
         if t:
             self.trades_today += 1
+            if target:
+                self.pos_stop_pct = stop_pct  # 新倉位的停損依開倉當下的剩餘額度
+        if rec["decision"] is not None:  # 模型失敗(稍後重試)不記,避免成績單被錯誤紀錄擠掉
+            d = rec["decision"]
+            side = self.position_info(price)
+            self.memory.record_decision(
+                ts, price, eq0, d, code, f"{d['leverage']:g}x" if d["action"] in ("LONG", "SHORT") else None,
+                {"position_after": side["side"] + (f" {side['leverage']:g}x" if side["side"] != "FLAT" else "")})
         rec.update(action_taken=why, code=code, trade=asdict(t) if t else None)
         return self._finish(rec, price, journal)
 
-    def _constraints(self) -> dict:
+    def _constraints(self, price: float) -> dict:
         c = self.cfg
-        return {"max_leverage": c.max_leverage, "taker_fee_rate": self.acct.fee_rate,
-                "stop_loss_pct_of_wallet": c.stop_loss_pct,
+        stop_pct, cap = self.sizing(price)
+        return {"max_leverage_now": round(cap, 2), "max_leverage_config": c.max_leverage,
+                "taker_fee_rate": self.acct.fee_rate,
+                "stop_loss_pct_of_wallet_for_new_position": round(stop_pct, 3),
+                "daily_loss_budget_left_pct_of_equity": round(self.budget_left(price) / self.acct.equity(price) * 100, 2)
+                if self.acct.equity(price) > 0 else 0.0,
                 "trades_left_today": max(0, c.max_trades_per_day - self.trades_today)}
 
     def _filter(self, d: Optional[FuturesDecision], price: float) -> Tuple[Optional[float], str, str]:
@@ -181,13 +247,16 @@ class FuturesAgent:
         if d.action == "HOLD":
             return None, "模型建議 HOLD", "hold"
         cur = self.acct.exposure_pct(price)
+        cap = self.sizing(price)[1]
         if d.action == "FLAT":
             target = 0.0
         else:
-            lev = min(d.leverage, c.max_leverage)
+            lev = min(d.leverage, cap)
             target = lev * 100 * (1 if d.action == "LONG" else -1)
         if d.action == "FLAT" and abs(self.acct.qty) < DUST:
             return None, "已是空手", "noop"
+        if d.action != "FLAT" and cap < MIN_LEVERAGE:
+            return None, "今日剩餘虧損額度不足,不開新倉", "budget_exhausted"
         if d.confidence < c.min_confidence:
             return None, f"信心 {d.confidence:.2f} 低於門檻 {c.min_confidence:g}", "low_confidence"
         same_side = target != 0 and cur != 0 and (target > 0) == (cur > 0)
@@ -195,7 +264,10 @@ class FuturesAgent:
             return None, f"已接近目標:目標 {target / 100:+.2f} 倍、目前 {cur / 100:+.2f} 倍", "noop"
         if self.trades_today >= c.max_trades_per_day:
             return None, f"今日交易已達 {c.max_trades_per_day} 次上限", "max_trades"
-        note = f"(槓桿上限 {c.max_leverage:g} 倍)" if d.action != "FLAT" and d.leverage > c.max_leverage else ""
+        note = ""
+        if d.action != "FLAT" and d.leverage > cap:
+            note = (f"(槓桿上限 {c.max_leverage:g} 倍)" if cap >= c.max_leverage
+                    else f"(依今日剩餘額度,上限 {cap:.2f} 倍)")
         label = {"LONG": "做多", "SHORT": "做空", "FLAT": "平倉"}[d.action]
         return target, f"執行 {label} {abs(target) / 100:.2f} 倍{note}", "execute"
 
@@ -216,14 +288,19 @@ class FuturesAgent:
     # ---- 持久化 ----
     def to_dict(self) -> dict:
         return {"acct": self.acct.to_dict(), "day": self.day, "day_start_equity": self.day_start_equity,
-                "trades_today": self.trades_today, "halted_day": self.halted_day}
+                "trades_today": self.trades_today, "halted_day": self.halted_day, "pos_stop_pct": self.pos_stop_pct,
+                "day_start_costs": self.day_start_costs, "memory": self.memory.to_dict()}
 
     @classmethod
-    def from_dict(cls, d: dict, cfg: FuturesRiskConfig) -> "FuturesAgent":
+    def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True) -> "FuturesAgent":
         try:
-            a = cls(FuturesAccount.from_dict(d["acct"]), cfg)
+            a = cls(FuturesAccount.from_dict(d["acct"]), cfg, learn)
             a.day, a.day_start_equity = str(d["day"]), float(d["day_start_equity"])
             a.trades_today, a.halted_day = int(d["trades_today"]), str(d["halted_day"])
+            # 舊版狀態檔沒有以下欄位
+            a.pos_stop_pct = float(d.get("pos_stop_pct", cfg.stop_loss_pct))
+            a.day_start_costs = float(d.get("day_start_costs", a._costs()))
+            a.memory = LearningMemory.from_dict(d.get("memory"), fill_label=None)
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(f"合約狀態檔格式錯誤:{e!r}") from e
         return a
@@ -248,6 +325,7 @@ class FuturesReplayResult:
     daily_halts: int
     funding_paid: float
     fees_paid: float
+    reflections: int  # 成功的每日檢討次數
     stopped_early: bool  # 達到 max_calls 或爆倉而提前結束
 
 
@@ -263,7 +341,8 @@ def futures_replay(model, symbol: str, interval: str, candles: List[Candle], age
     a = agent.acct
     start_price = end_price = candles[start + 1].open
     peak, max_dd = a.equity(start_price), 0.0
-    counts = {"decisions": 0, "errors": 0, "trades": 0, "stop_loss": 0, "liquidation": 0, "daily_loss": 0}
+    counts = {"decisions": 0, "errors": 0, "trades": 0, "stop_loss": 0, "liquidation": 0, "daily_loss": 0,
+              "reflections": 0}
     stopped = False
     prev_close = candles[start].close
     times = [t for t, _ in funding]
@@ -299,6 +378,7 @@ def futures_replay(model, symbol: str, interval: str, candles: List[Candle], age
                 counts["decisions"] += 1
             counts["errors"] += 1 if r["error"] else 0
             counts["trades"] += 1 if r["trade"] else 0
+            counts["reflections"] += 1 if r["reflection"] and not r["reflection"]["error"] else 0
         path = candle_path(nxt.open, nxt.high, nxt.low, nxt.close)
         for prev, p in zip(path, path[1:]):
             forced(p, nxt.ts, prev)
@@ -308,4 +388,4 @@ def futures_replay(model, symbol: str, interval: str, candles: List[Candle], age
     return FuturesReplayResult(processed, start_price, end_price, eq, (eq / a.initial - 1) * 100,
                                (end_price / start_price - 1) * 100, max_dd * 100, counts["decisions"],
                                counts["errors"], counts["trades"], counts["stop_loss"], counts["liquidation"],
-                               counts["daily_loss"], a.funding_paid, a.fees_paid, stopped)
+                               counts["daily_loss"], a.funding_paid, a.fees_paid, counts["reflections"], stopped)

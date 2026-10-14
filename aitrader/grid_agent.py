@@ -15,8 +15,8 @@ from .agent import utc_day
 from .grid import Fill, GridConfig, GridEngine, max_grids_for_spacing, spacing_pct
 from .llm import GridDecision, LLMConfigError, LLMError
 from .market import MIN_BARS, Candle, features
-from .memory import LearningMemory
-from .prompt import GRID_SYSTEM, REFLECTION_SYSTEM, build_grid_prompt, build_reflection_prompt
+from .memory import LearningMemory, daily_reflection
+from .prompt import GRID_SYSTEM, REFLECTION_SYSTEM, build_grid_prompt
 from .state import append_jsonl
 
 
@@ -169,7 +169,9 @@ class GridAgent:
                 rec["error"] = str(e)
             why, code, fills = self._apply(decision, price, ts)
             if decision is not None:  # 模型失敗(稍後重試)不記,避免成績單被 0 小時的錯誤紀錄擠掉
-                self.memory.record_decision(ts, price, eq0, rec["decision"], code)
+                params = (f"-{decision.lower_pct:g}%/+{decision.upper_pct:g}% {decision.grids} grids"
+                          if decision.action == "SET" else None)
+                self.memory.record_decision(ts, price, eq0, rec["decision"], code, params)
         rec.update(action_taken=why, code=code, fills=[asdict(f) for f in fills],
                    equity_after=round(self.equity(price), 4), grid_after=self.grid_info(price, ts))
         if journal:
@@ -177,24 +179,9 @@ class GridAgent:
         return rec
 
     def _reflect(self, model, symbol: str, ts: float, journal: Optional[str]) -> Optional[dict]:
-        """有待檢討的前一天資料時,請模型檢討並更新心得。失敗不影響交易,下次決策再試(最多 3 次)。"""
-        review = self.memory.review
-        if not (self.learn and review and getattr(model, "can_reflect", False)):
+        if not self.learn:
             return None
-        rec = {"kind": "grid_reflection", "ts": ts, "day": review["day_utc"], "summary": None,
-               "lessons": None, "meta": None, "error": None}
-        try:
-            r, meta = model.reflect(REFLECTION_SYSTEM, build_reflection_prompt(symbol, review, self.memory.lessons))
-            self.memory.set_lessons(r.lessons, review["day_utc"])
-            rec.update(summary=r.summary, lessons=list(self.memory.lessons), meta=meta)
-        except LLMConfigError:
-            raise
-        except LLMError as e:
-            self.memory.review_failed()
-            rec["error"] = str(e)
-        if journal:
-            append_jsonl(journal, rec)
-        return rec
+        return daily_reflection(self.memory, model, REFLECTION_SYSTEM, symbol, ts, journal, "grid_reflection")
 
     def _constraints(self) -> dict:
         c = self.cfg

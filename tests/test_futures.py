@@ -166,13 +166,37 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(r["code"], "stop_loss")
         self.assertEqual(r["trade"]["price"], 110)
 
-    def test_daily_limit_before_stop_and_halts(self):
-        a, cs = self.agent(stop_loss_pct=10, daily_loss_limit_pct=2), candles()
-        a.decide(SeqModel(D("LONG", 2)), "X", "1h", cs, 100, TS)
-        r = a.check(98, TS + 1, prev=100)
+    def test_stop_sized_by_daily_budget(self):
+        a, cs = self.agent(stop_loss_pct=10, daily_loss_limit_pct=2, risk_per_trade_pct=50), candles()
+        stop_pct, cap = a.sizing(100)
+        self.assertAlmostEqual(stop_pct, 1.0)  # min(錢包 10%, 剩餘額度 2% × 50%)
+        self.assertAlmostEqual(cap, 2.0)  # 1% / 最小停損距離 0.5%
+        r = a.decide(SeqModel(D("LONG", 5)), "X", "1h", cs, 100, TS)
+        self.assertIn("槓桿上限", r["action_taken"])
+        r = a.check(a.acct.stop_price(a.pos_stop_pct) - 0.01, TS + 1, prev=100)
+        self.assertEqual(r["code"], "stop_loss")
+        self.assertGreater(a.acct.equity(99), a.day_floor())  # 停損在當日額度內,不會停機
+        self.assertNotEqual(a.halted_day, a.day)
+
+    def test_daily_amount_shrinks_position_then_exhausts(self):
+        a, cs = self.agent(stop_loss_pct=3, daily_loss_limit_pct=50, daily_loss_amount=100), candles()
+        a.check(100, TS)  # 進入當天
+        self.assertAlmostEqual(a.day_floor(), 9900)  # 金額比 % 嚴格
+        self.assertAlmostEqual(a.sizing(100)[0], 0.5)  # 100 × 50% / 10000
+        a.acct.wallet -= 99.5  # 今天已虧掉幾乎全部額度
+        r = a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, TS)
+        self.assertEqual(r["code"], "budget_exhausted")
+        self.assertEqual(a.acct.qty, 0)
+        self.assertEqual(a.decide(SeqModel(D("FLAT")), "X", "1h", cs, 100, TS)["code"], "noop")  # 平倉不受影響
+
+    def test_daily_limit_trigger_when_costs_eat_budget(self):
+        a, cs = self.agent(stop_loss_pct=3, daily_loss_limit_pct=2), candles()
+        a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, TS)
+        a.acct.apply_funding(0.019, 100)  # 資金費吃掉大部分額度
+        r = a.check(99.5, TS + 1, prev=100)
         self.assertEqual(r["code"], "daily_loss")
         m = SeqModel(D("LONG", 1))
-        self.assertEqual(a.decide(m, "X", "1h", cs, 98, TS + 2)["code"], "halted")
+        self.assertEqual(a.decide(m, "X", "1h", cs, 99.5, TS + 2)["code"], "halted")
         self.assertEqual(m.calls, [])  # 停機中不問模型
 
     def test_daily_limit_checked_when_flat(self):
@@ -188,7 +212,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(m.calls, [])
 
     def test_liquidation_when_stop_is_behind(self):
-        a, cs = self.agent(max_leverage=10, stop_loss_pct=99, daily_loss_limit_pct=99), candles()
+        a, cs = self.agent(max_leverage=10, stop_loss_pct=99, daily_loss_limit_pct=99, risk_per_trade_pct=100), candles()
         a.decide(SeqModel(D("LONG", 10)), "X", "1h", cs, 100, TS)
         liq = a.acct.liq_price()
         r = a.check(liq - 5, TS + 1)
@@ -233,7 +257,7 @@ class ReplayTest(unittest.TestCase):
         crash = [Candle(c.ts, c.open, c.high, c.low, c.close, c.volume) for c in cs[:62]]
         crash += [Candle(cs[0].ts + i * 3600, 100, 100, 50, 50, 1) for i in range(62, 100)]
         a = FuturesAgent(FuturesAccount(10000), FuturesRiskConfig(max_leverage=10, stop_loss_pct=99,
-                                                                  daily_loss_limit_pct=99))
+                                                                  daily_loss_limit_pct=99, risk_per_trade_pct=100))
         r = futures_replay(SeqModel(D("LONG", 10)), "X", "1h", crash, a, [], every=1)
         self.assertEqual(r.liquidations, 1)
         self.assertTrue(r.stopped_early)
@@ -283,3 +307,92 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CurrencyTest(unittest.TestCase):
+    def test_money(self):
+        from aitrader.currency import Money, make_money
+        m = Money("TWD", 32)
+        self.assertAlmostEqual(m.to_usdt(32000), 1000)
+        self.assertEqual(m.fmt(100), "3,200 元")
+        self.assertEqual(m.fmt(-1.5, sign=True), "-48 元")
+        self.assertEqual(Money().fmt(12.345), "12.35 USDT")
+        self.assertEqual(make_money("TWD", 31.5).rate, 31.5)
+        with mock.patch("aitrader.currency.fetch_usdt_twd", return_value=32.1):
+            self.assertEqual(make_money("TWD", None).rate, 32.1)
+        with mock.patch("aitrader.currency.fetch_usdt_twd", side_effect=OSError("down")):
+            with self.assertRaisesRegex(ValueError, "--twd-rate"):
+                make_money("TWD", None)
+        with self.assertRaises(ValueError):
+            Money("JPY")
+
+
+class FuturesLearningTest(unittest.TestCase):
+    class Learner(SeqModel):
+        can_reflect = True
+
+        def __init__(self, *d):
+            super().__init__(*d)
+            self.reflect_calls = []
+
+        def reflect(self, system, prompt):
+            from aitrader.llm import Reflection
+            self.reflect_calls.append((system, prompt))
+            return Reflection("今天方向判斷錯", ["低波動時別反手"]), META
+
+    def test_memory_prompt_and_daily_reflection(self):
+        a, cs = FuturesAgent(acct(), FuturesRiskConfig()), candles()
+        m = self.Learner(D("LONG", 1))
+        day0 = TS - TS % 86400 + 3600
+        a.decide(m, "X", "1h", cs, 100, day0)
+        a.check(a.acct.stop_price(a.pos_stop_pct) - 0.01, day0 + 60)  # 停損事件記進這筆決策
+        a.decide(m, "X", "1h", cs, 99, day0 + 3600)
+        self.assertNotIn("memory", m.calls[0])
+        self.assertIn('"position_after":"LONG 1x"', m.calls[1])
+        self.assertIn("stop_loss", m.calls[1])
+        r = a.decide(m, "X", "1h", cs, 99, day0 + 86400)
+        self.assertEqual(r["reflection"]["lessons"], ["低波動時別反手"])
+        system, prompt = m.reflect_calls[0]
+        self.assertIn("FUTURES", system)
+        self.assertNotIn("grid_fills", prompt)
+        self.assertIn("低波動時別反手", m.calls[-1])
+        b = FuturesAgent(acct(), FuturesRiskConfig(), learn=False)
+        m2 = self.Learner(D("LONG", 1))
+        b.decide(m2, "X", "1h", cs, 100, day0)
+        b.decide(m2, "X", "1h", cs, 100, day0 + 86400)
+        self.assertEqual(m2.reflect_calls, [])
+        self.assertNotIn("memory", m2.calls[-1])
+
+    def test_old_state_without_new_fields(self):
+        a = FuturesAgent(acct(), FuturesRiskConfig())
+        a.decide(SeqModel(D("LONG", 1)), "X", "1h", candles(), 100, TS)
+        d = json.loads(json.dumps(a.to_dict()))
+        for k in ("pos_stop_pct", "day_start_costs", "memory"):
+            del d[k]
+        b = FuturesAgent.from_dict(d, FuturesRiskConfig(stop_loss_pct=4))
+        self.assertEqual(b.pos_stop_pct, 4)
+        self.assertEqual(b.memory.history, [])
+
+
+class FuturesCliCurrencyTest(unittest.TestCase):
+    def test_twd_paper_and_report(self):
+        from aitrader.cli import main
+        ft = FakeTime()
+        with tempfile.TemporaryDirectory() as t, \
+                mock.patch("aitrader.futures_cli.fetch_klines", return_value=candles()), \
+                mock.patch("aitrader.futures_cli.fetch_premium", return_value=(100.0, 0.0001, ft.now + 10 ** 6)), \
+                mock.patch("aitrader.futures_cli.time", ft), \
+                mock.patch("aitrader.futures_cli._make_model", return_value=SeqModel(D("LONG", 1))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            state, journal = os.path.join(t, "s.json"), os.path.join(t, "j.jsonl")
+            self.assertEqual(main(["futures", "--currency", "TWD", "--twd-rate", "32", "--cash", "32000",
+                                   "--daily-loss-amount", "640", "--state", state, "--journal", journal,
+                                   "--max-steps", "1"]), 0)
+            with open(state) as fh:
+                agent = json.load(fh)["agent"]
+            self.assertAlmostEqual(agent["acct"]["initial"], 1000)  # 32000 元 / 32
+            self.assertIn("32,000 元", out.getvalue())
+            self.assertIn("或虧 640 元", out.getvalue())
+            self.assertIn("今日額度剩", out.getvalue())
+            self.assertEqual(main(["report", journal, "--currency", "TWD", "--twd-rate", "32"]), 0)
+            self.assertIn("最後權益 3", out.getvalue())

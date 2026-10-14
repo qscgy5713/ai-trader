@@ -137,3 +137,14 @@ def features(cs: List[Candle]) -> Dict:
         "volume_vs_20_bar_avg": round(vols[-1] / (sum(vols[-20:]) / 20), 2) if sum(vols[-20:]) > 0 else 1.0,
         "recent_closes": [round(x, 6) for x in closes[-24:]],
     }
+
+
+MAX_EXCHANGE = "https://max-api.maicoin.com"  # 台灣交易所 MAX,用來取 USDT/TWD 匯率
+
+
+def fetch_usdt_twd() -> float:
+    """1 USDT 等於多少台幣(MAX 最新成交價)。"""
+    rate = float(_get(f"{MAX_EXCHANGE}/api/v2/tickers/usdttwd")["last"])
+    if not rate > 0:
+        raise ValueError(f"USDT/TWD 匯率異常:{rate}")
+    return rate

@@ -313,7 +313,7 @@ class LearningTest(unittest.TestCase):
     def test_memory_outcome_and_day_review(self):
         m = LearningMemory()
         m.record_decision(TS, 100, 1000, {"action": "SET", "lower_pct": 3, "upper_pct": 2, "grids": 8,
-                                           "confidence": 0.8, "reason": "r"}, "set")
+                                           "confidence": 0.8, "reason": "r"}, "set", "-3%/+2% 8 grids")
         m.on_tick(3, None)
         m.on_tick(0, "stop_loss")
         m.settle(TS + 7200, 98, 990)

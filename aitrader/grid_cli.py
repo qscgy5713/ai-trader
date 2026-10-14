@@ -14,6 +14,7 @@ from .grid_agent import GridAgent, GridRiskConfig, grid_replay
 from .llm import (GRID_SCHEMA, CachedModel, GeminiModel, GridDecision, LLMConfigError, LLMError, RuleGridModel,
                   parse_grid_decision)
 from .market import MIN_BARS, fetch_klines, fetch_price
+from .memory import format_reflection
 from .runtime import INTERVAL_SECS, StopFlag, handle_signals, wait
 from .state import acquire_lock, append_jsonl, load_json, save_json
 
@@ -46,13 +47,6 @@ def _default_name(a, prefix: str) -> str:
     """預設檔名;--no-learn 加後綴,方便同時跑「有學習 / 無學習」兩個版本比較。"""
     return f"{prefix}_{a.symbol}_{a.model}" + ("_nolearn" if a.no_learn else "")
 
-
-def _fmt_reflection(r: dict) -> str:
-    if r.get("error"):
-        return f"每日檢討({r['day']})失敗,稍後重試:{r['error']}"
-    lines = [f"每日檢討({r['day']}):{r['summary']}", "    目前心得:"]
-    lines += [f"    {i}. {x}" for i, x in enumerate(r["lessons"], 1)] or ["    (無)"]
-    return "\n".join(lines)
 
 
 def _hm(ts: float) -> str:
@@ -160,7 +154,7 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
                     rec = agent.decide(model, a.symbol, a.interval, candles, price, now, journal)
                     changed = True
                     if rec.get("reflection"):
-                        print(f"[grid] {_hm(now)} " + _fmt_reflection(rec["reflection"]), flush=True)
+                        print(f"[grid] {_hm(now)} " + format_reflection(rec["reflection"]), flush=True)
                     print(f"[grid] {_hm(now)} 現價 {price}  " + _fmt_decision(rec), flush=True)
                     if rec.get("error") and attempts + 1 < BAR_RETRIES:
                         attempts += 1
@@ -279,7 +273,7 @@ def report_grid(path: str, recs: List[dict]) -> int:
         ok = [r for r in refl if not r.get("error")]
         print(f"每日檢討 {len(ok)} 次(失敗 {len(refl) - len(ok)} 次)")
         if ok:
-            print("  " + _fmt_reflection(ok[-1]).replace("\n", "\n  "))
+            print("  " + format_reflection(ok[-1]).replace("\n", "\n  "))
     if decided:
         print("最近 5 次決策:")
         for r in decided[-5:]:
