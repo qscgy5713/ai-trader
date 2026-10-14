@@ -45,3 +45,16 @@ def wait(seconds: float, stop: StopFlag, clock=time) -> bool:
             return False
         clock.sleep(min(1.0, end - clock.monotonic()))
     return not stop.requested
+
+
+def parse_duration(text: str) -> float:
+    """「5s」「5m」「1h」或純數字(秒)→ 秒數。"""
+    t = str(text).strip().lower()
+    mult = {"s": 1, "m": 60, "h": 3600}.get(t[-1:], None)
+    try:
+        v = float(t[:-1]) * mult if mult else float(t)
+    except ValueError:
+        raise ValueError(f"時間格式錯誤:{text!r}(例如 5s、5m、1h 或秒數 300)") from None
+    if v < 0:
+        raise ValueError("時間不可為負")
+    return v

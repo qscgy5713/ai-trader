@@ -457,3 +457,34 @@ class DisplayTest(unittest.TestCase):
             self.assertIn("累計:成交 1 筆", out.getvalue())
             self.assertEqual(main(args), 0)  # 接續:啟動時列出最近成交
             self.assertIn("最近 1 筆成交", out.getvalue())
+
+
+class StatusTest(unittest.TestCase):
+    def test_parse_duration(self):
+        from aitrader.runtime import parse_duration
+        self.assertEqual(parse_duration("5s"), 5)
+        self.assertEqual(parse_duration("5m"), 300)
+        self.assertEqual(parse_duration("1h"), 3600)
+        self.assertEqual(parse_duration("90"), 90)
+        for bad in ("abc", "5x", "-5s"):
+            with self.assertRaises(ValueError):
+                parse_duration(bad)
+
+    def test_status_line_between_decisions(self):
+        from aitrader.cli import main
+        ft = FakeTime()
+        ft.now = (ft.now // 3600) * 3600 + 60  # 整點過 1 分鐘:離下一根 1h K 線還很久
+        with tempfile.TemporaryDirectory() as t, \
+                mock.patch("aitrader.futures_cli.fetch_klines", return_value=candles()), \
+                mock.patch("aitrader.futures_cli.fetch_premium", return_value=(100.0, 0.0, ft.now + 10 ** 6)), \
+                mock.patch("aitrader.futures_cli.time", ft), \
+                mock.patch("aitrader.futures_cli._make_model", return_value=SeqModel(D("LONG", 1))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(main(["futures", "--status-every", "10m", "--state", os.path.join(t, "s.json"),
+                                   "--journal", os.path.join(t, "j.jsonl"), "--max-steps", "2"]), 0)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["futures", "--status-every", "2s", "--max-steps", "1"]), 2)
+        lines = [l for l in out.getvalue().splitlines() if "下次問 AI" in l and "標記價" in l]
+        self.assertGreaterEqual(len(lines), 4)  # 一小時內約每 10 分鐘一行
+        self.assertLessEqual(len(lines), 7)
+        self.assertIn("今日額度剩", lines[0])

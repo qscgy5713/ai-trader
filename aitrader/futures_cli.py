@@ -16,7 +16,7 @@ from .llm import (FUTURES_SCHEMA, CachedModel, FuturesDecision, GeminiModel, LLM
                   RuleFuturesModel, parse_futures_decision)
 from .market import MIN_BARS, fetch_funding_history, fetch_klines, fetch_premium
 from .memory import format_reflection
-from .runtime import INTERVAL_SECS, StopFlag, handle_signals, wait
+from .runtime import INTERVAL_SECS, StopFlag, handle_signals, parse_duration, wait
 from .state import acquire_lock, load_json, save_json
 
 FETCH_BARS = 120
@@ -118,6 +118,9 @@ def _fmt_rec(rec: dict) -> str:
 # ------------------------------ futures(模擬盤) ------------------------------
 
 def cmd_futures(a) -> int:
+    a.status_secs = parse_duration(a.status_every)
+    if 0 < a.status_secs < 5:
+        raise ValueError("--status-every 最短 5 秒(設 0 關閉)")
     money = make_money(a.currency, a.twd_rate)
     rc = _risk_cfg(a, money)
     if a.interval not in INTERVAL_SECS:
@@ -172,6 +175,7 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
     steps = attempts = 0
     retry_at = 0.0
     rate = None
+    last_status = time.time()
     try:
         while not stop.requested:
             now = time.time()
@@ -197,6 +201,7 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
                         print(f"[futures] {_hm(now)} " + format_reflection(rec["reflection"]), flush=True)
                     print(f"[futures] {_hm(now)} 標記價 {price}  " + _fmt_rec(rec) + f"\n    {_fmt_pos(agent, price, money)}"
                           f"\n    {_fmt_summary(agent, price, money)}", flush=True)
+                    last_status = now
                     if rec.get("error") and attempts + 1 < BAR_RETRIES:
                         attempts += 1
                         retry_at = now + RETRY_DELAY
@@ -208,6 +213,12 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
                     if rec["code"] == "bankrupt":
                         print("[futures] 帳戶已爆倉,結束。用 --reset 重新開始", flush=True)
                         break
+                elif a.status_secs and not r and now - last_status >= a.status_secs - 0.5:
+                    # 兩次決策之間的狀態列:價格、持倉、未實現損益、剩餘額度(只顯示,不交易)
+                    nxt = time.strftime('%H:%M', time.localtime(last_bar + secs)) if last_bar else "-"
+                    print(f"[futures] {time.strftime('%H:%M:%S', time.localtime(now))} 標記價 {price:,.2f}  "
+                          f"{_fmt_pos(agent, price, money)}  下次問 AI {nxt}", flush=True)
+                    last_status = now
                 save()
             except LLMConfigError:
                 raise
@@ -216,7 +227,8 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
             if a.max_steps and steps >= a.max_steps:
                 break
             next_bar = (time.time() // secs + 1) * secs + 5
-            if not wait(min(a.check_every, max(1.0, next_bar - time.time())), stop, time):
+            gap = min(a.check_every, a.status_secs) if a.status_secs else a.check_every
+            if not wait(min(gap, max(1.0, next_bar - time.time())), stop, time):
                 break
     except KeyboardInterrupt:
         print("\n[futures] 強制結束,未存最後狀態", flush=True)
@@ -370,6 +382,8 @@ def add_parsers(sub) -> None:
     p = sub.add_parser("futures", help="合約模擬盤:AI 決定做多 / 做空 / 空手與槓桿(不下真單)")
     _add_common(p)
     p.add_argument("--check-every", type=float, default=30, help="檢查強平 / 停損 / 資金費的間隔秒數(預設 30)")
+    p.add_argument("--status-every", default="5m",
+                   help="兩次決策之間顯示狀態列(價格、持倉、未實現損益、剩餘額度)的間隔,如 5s、5m、1h;0=不顯示(預設 5m)")
     p.add_argument("--state", help="狀態檔(預設 state/futures_<SYMBOL>_<MODEL>[_nolearn].json)")
     p.add_argument("--journal", help="決策日誌(預設 journal/futures_<SYMBOL>_<MODEL>[_nolearn].jsonl)")
     p.add_argument("--reset", action="store_true", help="忽略既有狀態,重新開始")
