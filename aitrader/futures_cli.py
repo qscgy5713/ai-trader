@@ -54,6 +54,19 @@ def _default_name(a, prefix: str) -> str:
     return f"{prefix}_{a.symbol}_{a.model}" + ("_nolearn" if a.no_learn else "")
 
 
+def _budget_warning(rc: FuturesRiskConfig, equity: float, money: Money) -> str:
+    """--daily-loss-amount 比 % 上限寬時(會被 % 蓋過),回傳提醒文字;否則空字串。"""
+    if not rc.daily_loss_amount:
+        return ""
+    by_pct = equity * rc.daily_loss_limit_pct / 100
+    if rc.daily_loss_amount <= by_pct:
+        return ""
+    need = rc.daily_loss_amount / equity * 100
+    return (f"⚠ 每日金額上限 {money.fmt(rc.daily_loss_amount)} 比 --daily-loss-limit {rc.daily_loss_limit_pct:g}%"
+            f"({money.fmt(by_pct)})寬,實際以 {money.fmt(by_pct)} 為準(先到為準);"
+            f"要用金額上限,請加 --daily-loss-limit {min(99, int(need) + 1)}")
+
+
 def _risk_line(a, rc: FuturesRiskConfig, money: Money) -> str:
     amt = f"、或虧 {money.fmt(rc.daily_loss_amount)}" if rc.daily_loss_amount else ""
     style = {"conservative": "保守", "balanced": "平衡偏積極", "aggressive": "積極"}[a.style]
@@ -154,6 +167,9 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
         print(f"[futures] 新帳戶:{a.symbol} 模擬保證金 {money.fmt(agent.acct.initial)},"
               f"模型 {getattr(model, 'name', a.model)}")
     print(f"[futures] {_risk_line(a, rc, money)}")
+    warn = _budget_warning(rc, agent.acct.wallet, money)
+    if warn:
+        print(f"[futures] {warn}")
     if agent.acct.trade_count:
         try:
             p0 = fetch_premium(a.symbol)[0]
@@ -260,6 +276,9 @@ def cmd_futures_replay(a) -> int:
     est = (len(candles) - MIN_BARS) // a.every + 1
     print(WARN)
     print(f"{money.describe()}(回放全程用目前匯率換算);{_risk_line(a, rc, money)}")
+    warn = _budget_warning(rc, money.to_usdt(a.cash), money)
+    if warn:
+        print(warn)
     print(f"{a.symbol} 永續 {a.interval} × {len(candles)} 根,資金費 {len(funding)} 次;每 {a.every} 根問一次 AI(約 {est} 次)"
           + (f",實際呼叫上限 {a.max_calls} 次(快取命中不計)" if a.model == "gemini" else ""))
     if a.model == "gemini":

@@ -488,3 +488,16 @@ class StatusTest(unittest.TestCase):
         self.assertGreaterEqual(len(lines), 4)  # 一小時內約每 10 分鐘一行
         self.assertLessEqual(len(lines), 7)
         self.assertIn("今日額度剩", lines[0])
+
+
+class BudgetWarningTest(unittest.TestCase):
+    def test_warns_when_amount_overridden_by_pct(self):
+        from aitrader.currency import Money
+        from aitrader.futures_cli import _budget_warning
+        m = Money("TWD", 30)
+        rc = FuturesRiskConfig(daily_loss_limit_pct=5, daily_loss_amount=10000 / 30)
+        w = _budget_warning(rc, 1000, m)  # 本金 30,000 元
+        self.assertIn("1,500 元", w)
+        self.assertIn("--daily-loss-limit 34", w)
+        self.assertEqual(_budget_warning(FuturesRiskConfig(daily_loss_limit_pct=40, daily_loss_amount=10000 / 30), 1000, m), "")
+        self.assertEqual(_budget_warning(FuturesRiskConfig(), 1000, m), "")

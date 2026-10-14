@@ -220,7 +220,7 @@ USDT 永續合約、單向持倉、全倉保證金。**只模擬,不下真單**;
 | `--cash` | 10000 | 模擬保證金,以 `--currency` 計 |
 | `--currency` | `USDT` | `USDT` 或 `TWD`(輸入與顯示幣別) |
 | `--twd-rate` | 即時 | USDT/TWD 匯率;不指定則從 MAX 取 |
-| `--daily-loss-amount` | 0 | 單日最多虧損金額(以 `--currency` 計),與 % 先到為準;0 = 不用 |
+| `--daily-loss-amount` | 0 | 單日最多虧損金額(以 `--currency` 計),與 % 先到為準;0 = 不用。金額比 `--daily-loss-limit` 寬時會被 % 蓋過,啟動時會提醒 |
 | `--risk-per-trade` | 50 | 每筆停損時最多用掉當日剩餘額度的 % |
 | `--min-stop-distance` | 0.5 | 停損距離(價格 %)下限,決定可開槓桿上限 |
 | `--no-learn` | 關 | 關閉學習 |
