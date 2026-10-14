@@ -23,7 +23,7 @@ from .grid_agent import candle_path
 from .llm import FuturesDecision, LLMConfigError, LLMError
 from .market import MIN_BARS, Candle, features
 from .memory import LearningMemory, daily_reflection
-from .prompt import FUTURES_REFLECTION_SYSTEM, FUTURES_SYSTEM, build_futures_prompt
+from .prompt import FUTURES_REFLECTION_SYSTEM, build_futures_prompt, futures_system
 from .state import append_jsonl
 
 BANKRUPT_PCT = 1.0  # 權益低於初始資金此 % 視為爆倉,停止交易
@@ -64,9 +64,10 @@ class FuturesRiskConfig:
 
 
 class FuturesAgent:
-    def __init__(self, acct: FuturesAccount, cfg: FuturesRiskConfig, learn: bool = True):
+    def __init__(self, acct: FuturesAccount, cfg: FuturesRiskConfig, learn: bool = True, style: str = "balanced"):
         cfg.validate()
         self.acct, self.cfg = acct, cfg
+        self.style, self.system = style, futures_system(style)  # 交易風格只影響提示詞,不影響風控
         self.day, self.day_start_equity, self.trades_today = "", acct.wallet, 0
         self.halted_day = ""
         self.pos_stop_pct = cfg.stop_loss_pct  # 目前倉位的停損(錢包 %),開倉時依剩餘額度決定
@@ -208,7 +209,7 @@ class FuturesAgent:
                                           self._constraints(price), self.memory.prompt_view() if self.learn else None)
             decision = None
             try:
-                decision, meta = model.decide(FUTURES_SYSTEM, prompt, feats)
+                decision, meta = model.decide(self.system, prompt, feats)
                 rec["decision"], rec["meta"] = asdict(decision), meta
             except LLMConfigError:
                 raise
@@ -292,9 +293,9 @@ class FuturesAgent:
                 "day_start_costs": self.day_start_costs, "memory": self.memory.to_dict()}
 
     @classmethod
-    def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True) -> "FuturesAgent":
+    def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True, style: str = "balanced") -> "FuturesAgent":
         try:
-            a = cls(FuturesAccount.from_dict(d["acct"]), cfg, learn)
+            a = cls(FuturesAccount.from_dict(d["acct"]), cfg, learn, style)
             a.day, a.day_start_equity = str(d["day"]), float(d["day_start_equity"])
             a.trades_today, a.halted_day = int(d["trades_today"]), str(d["halted_day"])
             # 舊版狀態檔沒有以下欄位

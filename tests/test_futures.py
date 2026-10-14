@@ -396,3 +396,34 @@ class FuturesCliCurrencyTest(unittest.TestCase):
             self.assertIn("今日額度剩", out.getvalue())
             self.assertEqual(main(["report", journal, "--currency", "TWD", "--twd-rate", "32"]), 0)
             self.assertIn("最後權益 3", out.getvalue())
+
+
+class StyleTest(unittest.TestCase):
+    def test_style_changes_system_prompt_only(self):
+        from aitrader.prompt import futures_system
+        seen = {}
+        for style in ("conservative", "balanced", "aggressive"):
+            class M(SeqModel):
+                def decide(self, system, prompt, feats=None):
+                    seen[style] = system
+                    return super().decide(system, prompt, feats)
+            a = FuturesAgent(acct(), FuturesRiskConfig(), style=style)
+            a.decide(M(D("LONG", 5)), "X", "1h", candles(), 100, TS)
+            self.assertLessEqual(a.acct.exposure_pct(100), 200 + 1e-6)  # 風控不受風格影響
+        self.assertIn("CONSERVATIVE", seen["conservative"])
+        self.assertIn("slightly proactive", seen["balanced"])
+        self.assertIn("AGGRESSIVE", seen["aggressive"])
+        self.assertNotIn("{style}", seen["balanced"])
+        with self.assertRaises(ValueError):
+            futures_system("yolo")
+
+    def test_style_sets_default_min_confidence(self):
+        import argparse
+        from aitrader.currency import Money
+        from aitrader.futures_cli import _add_common, _risk_cfg
+        ap = argparse.ArgumentParser()
+        _add_common(ap)
+        self.assertEqual(_risk_cfg(ap.parse_args([]), Money()).min_confidence, 0.5)
+        self.assertEqual(_risk_cfg(ap.parse_args(["--style", "conservative"]), Money()).min_confidence, 0.6)
+        self.assertEqual(_risk_cfg(ap.parse_args(["--style", "aggressive", "--min-confidence", "0.7"]),
+                                   Money()).min_confidence, 0.7)

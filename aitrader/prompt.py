@@ -89,7 +89,7 @@ def build_reflection_prompt(symbol: str, review: dict, lessons: list) -> str:
 
 # ---------------- 合約模式 ----------------
 
-FUTURES_SYSTEM = """You are a cautious trader managing a USDT-margined PERPETUAL FUTURES account in PAPER TRADING (no real money).
+FUTURES_SYSTEM_TEMPLATE = """You are a cautious trader managing a USDT-margined PERPETUAL FUTURES account in PAPER TRADING (no real money).
 You can go LONG or SHORT with leverage up to the stated max_leverage. Each turn you receive technical features of the latest CLOSED candles,
 the current position and the funding rate, and choose ONE action:
 - LONG / SHORT: hold a long / short position with the given `leverage` (position notional / equity, e.g. 1.0 = no extra leverage).
@@ -103,11 +103,31 @@ Guidelines:
 - If `memory` is present: `recent_decisions_with_outcomes` shows what your recent choices led to (until the next decision),
   and `lessons_from_daily_reviews` are notes from your own past reviews. Use them to avoid repeating mistakes,
   but single outcomes are noisy; do not overreact to one result.
-- Prefer FLAT or HOLD when the trend is unclear. Every trade costs fees; avoid churning.
+{style}
 - Funding: when funding_rate_per_8h is positive, longs pay shorts every 8 hours (and vice versa). It matters for long holding periods.
 - confidence reflects strength of evidence (0-1). Base the decision ONLY on the provided data. For FLAT / HOLD set leverage to 0.
 - Write `reason` in Traditional Chinese, concise (<= 200 characters).
 Respond with JSON only."""
+
+# 交易風格:只改變「多有把握才進場」的指引;風控(槓桿上限、停損、每日額度)不受影響
+FUTURES_STYLES = {
+    "conservative": """- Style: CONSERVATIVE. Prefer FLAT or HOLD when the trend is unclear; enter only on clear, confirmed trends.
+  Every trade costs fees; avoid churning.""",
+    "balanced": """- Style: BALANCED, slightly proactive. You do NOT need a perfectly clear trend to act.
+  Take a position when the evidence moderately favors one direction, e.g. price on one side of both SMAs with MACD agreeing,
+  a breakout from a narrow range, or building RSI momentum. Use modest leverage (about 0.5-1x) when conviction is moderate.
+  Low volatility or low volume alone is NOT a reason to stay flat if the direction leans one way.
+  Stay FLAT only when signals genuinely conflict. Still avoid flipping back and forth on noise; fees matter.""",
+    "aggressive": """- Style: AGGRESSIVE. Take a directional position whenever there is any reasonable edge; FLAT should be rare.
+  Scale leverage with conviction (within max_leverage_now). Still exit or reverse when the evidence turns against you,
+  and avoid flipping on pure noise.""",
+}
+
+
+def futures_system(style: str = "balanced") -> str:
+    if style not in FUTURES_STYLES:
+        raise ValueError(f"style 只支援 {', '.join(FUTURES_STYLES)}")
+    return FUTURES_SYSTEM_TEMPLATE.replace("{style}", FUTURES_STYLES[style])
 
 
 def build_futures_prompt(symbol: str, interval: str, feats: dict, position: dict, funding_rate: Optional[float],

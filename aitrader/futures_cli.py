@@ -22,6 +22,7 @@ from .state import acquire_lock, load_json, save_json
 FETCH_BARS = 120
 BAR_RETRIES = 3
 RETRY_DELAY = 60
+STYLE_MIN_CONFIDENCE = {"conservative": 0.6, "balanced": 0.5, "aggressive": 0.45}  # 未指定 --min-confidence 時依風格
 WARN = "⚠ 合約有槓桿與強平風險;這是模擬盤,不下真單。模擬結果不代表實盤(實盤另有深度、插針、維持保證金級距等差異)"
 
 
@@ -36,14 +37,16 @@ def _make_model(name: str, cache: bool = False, cache_dir: str = "cache"):
 def _risk_cfg(a, money: Money) -> FuturesRiskConfig:
     if a.daily_loss_amount < 0:
         raise ValueError("--daily-loss-amount 不可為負")
-    c = FuturesRiskConfig(a.max_leverage, a.min_confidence, a.min_change, a.stop_loss, a.daily_loss_limit,
+    min_conf = a.min_confidence if a.min_confidence is not None else STYLE_MIN_CONFIDENCE[a.style]
+    c = FuturesRiskConfig(a.max_leverage, min_conf, a.min_change, a.stop_loss, a.daily_loss_limit,
                           a.max_trades, money.to_usdt(a.daily_loss_amount), a.risk_per_trade, a.min_stop_distance)
     c.validate()
     return c
 
 
 def _new_agent(a, rc: FuturesRiskConfig, money: Money) -> FuturesAgent:
-    return FuturesAgent(FuturesAccount(money.to_usdt(a.cash), a.fee, a.slippage_bps), rc, learn=not a.no_learn)
+    return FuturesAgent(FuturesAccount(money.to_usdt(a.cash), a.fee, a.slippage_bps), rc, learn=not a.no_learn,
+                        style=a.style)
 
 
 def _default_name(a, prefix: str) -> str:
@@ -53,7 +56,8 @@ def _default_name(a, prefix: str) -> str:
 
 def _risk_line(a, rc: FuturesRiskConfig, money: Money) -> str:
     amt = f"、或虧 {money.fmt(rc.daily_loss_amount)}" if rc.daily_loss_amount else ""
-    return (f"槓桿上限 {rc.max_leverage:g} 倍;單日虧損上限 {rc.daily_loss_limit_pct:g}%{amt}(先到為準);"
+    style = {"conservative": "保守", "balanced": "平衡偏積極", "aggressive": "積極"}[a.style]
+    return (f"風格 {style}(信心門檻 {rc.min_confidence:g});槓桿上限 {rc.max_leverage:g} 倍;單日虧損上限 {rc.daily_loss_limit_pct:g}%{amt}(先到為準);"
             f"每筆最多用掉剩餘額度 {rc.risk_per_trade_pct:g}%")
 
 
@@ -117,7 +121,7 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
         d = load_json(path)
         if d.get("symbol") != a.symbol or d.get("interval") != a.interval or d.get("model") != a.model:
             raise ValueError(f"狀態檔 {path} 的交易對 / 週期 / 模型與這次不同;加 --reset 重新開始或用 --state 指定其他檔案")
-        agent = FuturesAgent.from_dict(d["agent"], rc, not a.no_learn)  # 風控與學習開關以這次啟動為準
+        agent = FuturesAgent.from_dict(d["agent"], rc, not a.no_learn, a.style)  # 風控、學習、風格以這次啟動為準
         last_bar, next_funding = d.get("last_bar_ts", 0), d.get("next_funding_ts", 0)
         print(f"[futures] 接續 {path}")
     else:
@@ -307,6 +311,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--interval", default="1h", help="多久問一次 AI(K 線週期,預設 1h;支援 " + "/".join(INTERVAL_SECS) + ")")
     p.add_argument("--model", choices=["gemini", "rule"], default="gemini",
                    help="gemini=Gemini API;rule=離線規則基準(均線 + MACD 順勢),不花錢(預設 gemini)")
+    p.add_argument("--style", choices=["conservative", "balanced", "aggressive"], default="balanced",
+                   help="交易風格:conservative 保守(趨勢明確才進場)/ balanced 平衡偏積極 / aggressive 積極;"
+                        "只影響 AI 進場意願,風控不變(預設 balanced)")
     p.add_argument("--currency", choices=["USDT", "TWD"], default="USDT",
                    help="輸入與顯示的幣別;TWD 時 --cash、--daily-loss-amount 以台幣計(帳戶實際仍為 USDT,預設 USDT)")
     p.add_argument("--twd-rate", type=float, help="USDT/TWD 匯率;不指定則從 MAX 取即時匯率")
@@ -315,7 +322,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--slippage-bps", type=float, default=2, help="滑價,基點(預設 2)")
     g = p.add_argument_group("合約風控")
     g.add_argument("--max-leverage", type=float, default=2, help="槓桿上限,AI 要求更高會被截斷(預設 2,最多 10)")
-    g.add_argument("--min-confidence", type=float, default=0.6, help="AI 信心低於此值不交易(預設 0.6)")
+    g.add_argument("--min-confidence", type=float, default=None,
+                   help="AI 信心低於此值不交易(預設依風格:保守 0.6 / 平衡 0.5 / 積極 0.45)")
     g.add_argument("--min-change", type=float, default=20, help="同方向調整的曝險差距小於此 %% 不交易,100 = 1 倍(預設 20)")
     g.add_argument("--stop-loss", type=float, default=3, help="持倉虧損達錢包此 %% 強制平倉(預設 3)")
     g.add_argument("--daily-loss-limit", type=float, default=5, help="權益單日下跌達此 %% 平倉並停到隔天(預設 5)")
