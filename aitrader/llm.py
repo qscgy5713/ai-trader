@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 ACTIONS = ("BUY", "SELL", "HOLD")
@@ -78,6 +78,8 @@ def parse_decision(text: str) -> Decision:
 class GeminiModel:
     """Gemini generateContent(JSON 結構化輸出)。金鑰放 header,不出現在網址或錯誤訊息。"""
 
+    can_reflect = True  # 支援每日檢討(reflect)
+
     def __init__(self, api_key: str, model: str, timeout: float = 60.0, max_retries: int = 3,
                  temperature: float = 0.2, schema: Optional[dict] = None,
                  parser: Optional[Callable[[str], object]] = None):
@@ -123,13 +125,20 @@ class GeminiModel:
         raise LLMError("Gemini 重試次數用盡")  # pragma: no cover
 
     def decide(self, system: str, prompt: str, feats: Optional[dict] = None) -> Tuple[object, Dict]:
+        return self._generate(system, prompt, self.schema, self.parser)
+
+    def reflect(self, system: str, prompt: str) -> Tuple["Reflection", Dict]:
+        """每日檢討:回顧過去決策的結果,整理成心得。"""
+        return self._generate(system, prompt, REFLECTION_SCHEMA, parse_reflection)
+
+    def _generate(self, system: str, prompt: str, schema: dict, parser: Callable[[str], object]) -> Tuple[object, Dict]:
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": self.temperature,
                 "responseMimeType": "application/json",
-                "responseSchema": self.schema,
+                "responseSchema": schema,
             },
         }
         t0 = time.monotonic()
@@ -152,7 +161,7 @@ class GeminiModel:
             "tokens_in": usage.get("promptTokenCount", 0),
             "tokens_out": usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0),
         }
-        return self.parser(text), meta
+        return parser(text), meta
 
 
 def _error_message(e: urllib.error.HTTPError) -> str:
@@ -192,21 +201,31 @@ class CachedModel:
         self.hits = self.misses = 0
         os.makedirs(cache_dir, exist_ok=True)
 
+    @property
+    def can_reflect(self) -> bool:
+        return getattr(self.inner, "can_reflect", False)
+
     def _path(self, system: str, prompt: str) -> str:
         h = hashlib.sha256(f"{self.inner.name}\n{system}\n{prompt}".encode()).hexdigest()
         return os.path.join(self.cache_dir, f"{h}.json")
 
     def decide(self, system: str, prompt: str, feats: Optional[dict] = None) -> Tuple[object, Dict]:
+        return self._cached(system, prompt, lambda: self.inner.decide(system, prompt, feats), self.decision_cls)
+
+    def reflect(self, system: str, prompt: str) -> Tuple["Reflection", Dict]:
+        return self._cached(system, prompt, lambda: self.inner.reflect(system, prompt), Reflection)
+
+    def _cached(self, system: str, prompt: str, call, cls) -> Tuple[object, Dict]:
         path = self._path(system, prompt)
         if os.path.exists(path):
             try:
                 with open(path) as fh:
                     d = json.load(fh)
                 self.hits += 1
-                return self.decision_cls(**d["decision"]), dict(d["meta"], cached=True)
+                return cls(**d["decision"]), dict(d["meta"], cached=True)
             except (ValueError, KeyError, TypeError):
                 pass  # 快取壞了就重新呼叫
-        decision, meta = self.inner.decide(system, prompt, feats)
+        decision, meta = call()
         self.misses += 1
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
@@ -301,3 +320,37 @@ class RuleGridModel:
         half = min(max(3 * feats["atr14_pct"], 2.0), 12.0)
         grids = max(2, int(2 * half / 0.8))  # 目標格距約 0.8%
         return GridDecision("SET", half, half, grids, 0.7, f"以 ATR 設定 ±{half:.1f}% 區間"), meta
+
+
+# ---------------- 每日檢討(讓 AI 從過去的結果學習) ----------------
+
+MAX_LESSONS = 5
+
+
+@dataclass
+class Reflection:
+    summary: str  # 對前一天的簡短總結
+    lessons: List[str]  # 更新後的完整心得清單(取代舊的)
+
+
+REFLECTION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "summary": {"type": "STRING", "description": "brief review of the day in Traditional Chinese, <= 200 chars"},
+        "lessons": {"type": "ARRAY", "items": {"type": "STRING"},
+                    "description": f"updated full list of at most {MAX_LESSONS} lessons, Traditional Chinese, each <= 120 chars"},
+    },
+    "required": ["summary", "lessons"],
+    "propertyOrdering": ["summary", "lessons"],
+}
+
+
+def parse_reflection(text: str) -> Reflection:
+    try:
+        d = json.loads(text)
+    except (ValueError, TypeError) as e:
+        raise LLMError(f"模型輸出不是合法 JSON:{str(text)[:120]!r}") from e
+    if not isinstance(d, dict) or not isinstance(d.get("summary"), str) or not isinstance(d.get("lessons"), list):
+        raise LLMError("檢討輸出格式錯誤:需要 summary 字串與 lessons 陣列")
+    lessons = [x.strip()[:200] for x in d["lessons"] if isinstance(x, str) and x.strip()]
+    return Reflection(d["summary"].strip()[:500], lessons[:MAX_LESSONS])

@@ -114,6 +114,25 @@ python3 -m aitrader report journal/grid_BTCUSDT_gemini.jsonl
   - `PAUSE`:撤掉網格、全部賣出(例如明顯跌破)。之後再 `SET` 才恢復。
 - 重設網格時只買賣「新舊網格所需持幣的差額」,不會先全部賣掉再買回。
 - 強制規則:跌破區間下緣再往下 `--stop-loss`% 停損;權益單日跌 `--daily-loss-limit`%,清倉。兩者觸發後**當日(UTC)停機、不問 AI**。
+- **調整頻率**:`--interval` 決定多久問一次 AI(`1m`~`1d`,預設 `1h`)。例如 `grid --interval 4h` 每 4 小時一次,
+  `--interval 15m` 每 15 分鐘一次(費用約 4 倍)。網格本身的撮合頻率由 `--tick` 決定,與此無關。
+
+### 學習(預設開啟)
+
+不是重新訓練模型,而是把 AI 自己的成績單放進提示詞:
+1. **最近結果**:每次決策附上最近 8 次決策與「到下一次決策為止」的結果(價格、權益變化、網格成交、停損事件)。
+2. **每日檢討**:UTC 換日後的第一次決策前,多呼叫一次 Gemini 檢討前一天的所有決策,整理成最多 5 條心得,
+   之後每次決策都附上,下次檢討時更新(失敗會在之後的決策重試,最多 3 次)。
+
+注意:樣本少時容易學錯,心得只是參考;停損、上限等規則仍由程式強制執行。費用約增加 30~50%
+(每次決策多幾百 tokens,每天多一次檢討)。
+
+用 `--no-learn` 關閉學習,預設狀態檔與日誌會加 `_nolearn` 後綴,可以和學習版**同時跑**來比較:
+```bash
+python3 -m aitrader grid               # 學習版
+python3 -m aitrader grid --no-learn    # 對照組(另開一個終端機)
+```
+`report` 會顯示每日檢討次數與最新心得。
 
 | 參數 | 預設 | 說明 |
 |---|---|---|
@@ -126,6 +145,7 @@ python3 -m aitrader report journal/grid_BTCUSDT_gemini.jsonl
 | `--daily-loss-limit` | 3 | 權益單日下跌達此 % 清倉,當日停機 |
 | `--max-reconfigs` | 4 | 每日最多重設 / 暫停次數 |
 | `--min-change` | 1 | 新舊區間上下緣都差不到此 %、且格數相同時不重設 |
+| `--no-learn` | 關 | 關閉學習(見下方「學習」) |
 
 另有 `--state`、`--journal`、`--reset`、`--max-steps`(`grid`)與 `--limit`、`--every`、`--max-calls`、`--cache-dir`(`grid-replay`),意義同上。
 回放時 K 線內部走勢未知,以保守路徑(陽線先探低、陰線先拉高)撮合,成交次數會比實際少。
@@ -158,6 +178,7 @@ aitrader/
   grid.py       網格引擎(等比網格、從既有持倉重建、停損)
   grid_agent.py AI 調整網格:風控、套用 AI 決策、歷史回放
   grid_cli.py   grid / grid-replay 指令與網格報表
+  memory.py     學習紀錄:最近決策的結果、每日檢討的待檢資料與心得
   runtime.py    安全停止(訊號)與可中斷等待
   state.py      狀態原子寫入、檔案鎖、決策日誌
   cli.py        命令列入口(python3 -m aitrader)

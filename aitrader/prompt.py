@@ -49,12 +49,16 @@ Guidelines:
 - Prefer KEEP when the price is still well inside the range and the regime has not changed.
 - Consider SET when price is near or outside the range edge, or volatility changed a lot (ATR is a good guide for range width).
 - confidence reflects strength of evidence (0-1). Base the decision ONLY on the provided data.
+- If `memory` is present: `recent_decisions_with_outcomes` shows what your recent choices led to (until the next decision),
+  and `lessons_from_daily_reviews` are notes from your own past reviews. Use them to avoid repeating mistakes,
+  but single outcomes are noisy; do not overreact to one result.
 - For KEEP / PAUSE set lower_pct, upper_pct and grids to 0.
 - Write `reason` in Traditional Chinese, concise (<= 200 characters).
 Respond with JSON only."""
 
 
-def build_grid_prompt(symbol: str, interval: str, feats: dict, grid: Optional[dict], constraints: dict) -> str:
+def build_grid_prompt(symbol: str, interval: str, feats: dict, grid: Optional[dict], constraints: dict,
+                      memory: Optional[dict] = None) -> str:
     payload = {
         "symbol": symbol,
         "candle_interval": interval,
@@ -62,4 +66,22 @@ def build_grid_prompt(symbol: str, interval: str, feats: dict, grid: Optional[di
         "current_grid": grid if grid is not None else "none (idle, all cash)",
         "constraints": constraints,
     }
+    if memory is not None:
+        payload["memory"] = memory
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+REFLECTION_SYSTEM = """You review yesterday's decisions of an AI-managed spot GRID trading bot (paper trading).
+You receive the day's results and every decision (KEEP / SET / PAUSE, with parameters, what actually happened,
+and the outcome until the next decision: price change, equity change, grid fills, forced exits), plus your current lessons.
+Task: write a short summary of the day, and return an UPDATED full list of at most 5 lessons that would improve future decisions.
+- Lessons must be concrete and actionable (e.g. about range width vs volatility, grid count vs fees, when to PAUSE or not reconfigure).
+- Keep earlier lessons that still hold; revise or drop ones contradicted by evidence. Fewer, better lessons are preferred.
+- One day is a small sample: do not draw strong conclusions from a single event; say so when evidence is weak.
+- Only rely on the data provided. Write in Traditional Chinese.
+Respond with JSON only."""
+
+
+def build_reflection_prompt(symbol: str, review: dict, lessons: list) -> str:
+    payload = {"symbol": symbol, "day_review": review, "current_lessons": lessons}
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

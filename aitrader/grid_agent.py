@@ -15,7 +15,8 @@ from .agent import utc_day
 from .grid import Fill, GridConfig, GridEngine, max_grids_for_spacing, spacing_pct
 from .llm import GridDecision, LLMConfigError, LLMError
 from .market import MIN_BARS, Candle, features
-from .prompt import GRID_SYSTEM, build_grid_prompt
+from .memory import LearningMemory
+from .prompt import GRID_SYSTEM, REFLECTION_SYSTEM, build_grid_prompt, build_reflection_prompt
 from .state import append_jsonl
 
 
@@ -49,7 +50,8 @@ class GridRiskConfig:
 class GridAgent:
     """帳戶 + 目前的網格 + 風控狀態。沒有網格時資金全為計價幣(暫停 / 停損都會清倉)。"""
 
-    def __init__(self, cash: float, cfg: GridRiskConfig, fee: float = 0.001, slippage: float = 0.0005):
+    def __init__(self, cash: float, cfg: GridRiskConfig, fee: float = 0.001, slippage: float = 0.0005,
+                 learn: bool = True):
         cfg.validate()
         if cash <= 0:
             raise ValueError("資金必須 > 0")
@@ -62,6 +64,10 @@ class GridAgent:
         self.halted_day = ""  # 觸發停損 / 單日虧損上限的那一天(UTC);當天不再建網格
         # 已結束網格的累計統計(加上目前網格的即為總計)
         self.closed_cycles, self.closed_profit, self.closed_fees = 0, 0.0, 0.0
+        # 學習:成績單一律記錄;learn=False 時不放進提示詞、也不做每日檢討(用來比較有無學習的差異)
+        self.learn = learn
+        self.memory = LearningMemory()
+        self.day_start_fees = 0.0
 
     # ---- 查詢 ----
     def equity(self, price: float) -> float:
@@ -100,7 +106,10 @@ class GridAgent:
     def _new_day(self, ts: float, price: float) -> None:
         day = utc_day(ts)
         if day != self.day:
-            self.day, self.day_start_equity, self.reconfigs_today = day, self.equity(price), 0
+            eq, fees = self.equity(price), self.totals()["fees"]
+            self.memory.roll_day(self.day, ts, price, eq, self.day_start_equity, fees - self.day_start_fees)
+            self.day, self.day_start_equity, self.reconfigs_today = day, eq, 0
+            self.day_start_fees = fees
 
     def _close_engine(self) -> None:
         e = self.engine
@@ -129,22 +138,27 @@ class GridAgent:
                 fills.append(self.engine.liquidate(price, ts, "單日虧損上限"))
                 self._close_engine()
             self.halted_day, event = self.day, "daily_loss"
+        self.memory.on_tick(sum(1 for f in fills if f.level >= 0), event)
         return fills, event
 
     def decide(self, model, symbol: str, interval: str, candles: List[Candle], price: float, ts: float,
                journal: Optional[str] = None) -> dict:
-        """K 線收盤後的決策點:問模型、過濾、套用。停機中不問模型(省費用)。"""
+        """K 線收盤後的決策點:(換日時先做每日檢討)問模型、過濾、套用。停機中不問模型(省費用)。"""
         self._new_day(ts, price)
+        eq0 = self.equity(price)
+        self.memory.settle(ts, price, eq0)
         rec = {"kind": "grid_decision", "ts": ts, "symbol": symbol, "price": price,
-               "equity_before": round(self.equity(price), 4), "grid_before": self.grid_info(price, ts),
-               "model": getattr(model, "name", "?"), "decision": None, "meta": None, "error": None}
+               "equity_before": round(eq0, 4), "grid_before": self.grid_info(price, ts),
+               "model": getattr(model, "name", "?"), "decision": None, "meta": None, "error": None,
+               "reflection": self._reflect(model, symbol, ts, journal)}
         fills: List[Fill] = []
         if self.halted_day == self.day:
             why, code = "今日已觸發停損或單日虧損上限,停機到明天(UTC)", "halted"
         else:
             feats = features(candles)
             info = self.grid_info(price, ts)
-            prompt = build_grid_prompt(symbol, interval, feats, info, self._constraints())
+            prompt = build_grid_prompt(symbol, interval, feats, info, self._constraints(),
+                                       self.memory.prompt_view() if self.learn else None)
             decision = None
             try:
                 decision, meta = model.decide(GRID_SYSTEM, prompt, dict(feats, grid=info))
@@ -154,8 +168,30 @@ class GridAgent:
             except LLMError as e:
                 rec["error"] = str(e)
             why, code, fills = self._apply(decision, price, ts)
+            if decision is not None:  # 模型失敗(稍後重試)不記,避免成績單被 0 小時的錯誤紀錄擠掉
+                self.memory.record_decision(ts, price, eq0, rec["decision"], code)
         rec.update(action_taken=why, code=code, fills=[asdict(f) for f in fills],
                    equity_after=round(self.equity(price), 4), grid_after=self.grid_info(price, ts))
+        if journal:
+            append_jsonl(journal, rec)
+        return rec
+
+    def _reflect(self, model, symbol: str, ts: float, journal: Optional[str]) -> Optional[dict]:
+        """有待檢討的前一天資料時,請模型檢討並更新心得。失敗不影響交易,下次決策再試(最多 3 次)。"""
+        review = self.memory.review
+        if not (self.learn and review and getattr(model, "can_reflect", False)):
+            return None
+        rec = {"kind": "grid_reflection", "ts": ts, "day": review["day_utc"], "summary": None,
+               "lessons": None, "meta": None, "error": None}
+        try:
+            r, meta = model.reflect(REFLECTION_SYSTEM, build_reflection_prompt(symbol, review, self.memory.lessons))
+            self.memory.set_lessons(r.lessons, review["day_utc"])
+            rec.update(summary=r.summary, lessons=list(self.memory.lessons), meta=meta)
+        except LLMConfigError:
+            raise
+        except LLMError as e:
+            self.memory.review_failed()
+            rec["error"] = str(e)
         if journal:
             append_jsonl(journal, rec)
         return rec
@@ -217,12 +253,13 @@ class GridAgent:
                 "engine": self.engine.to_dict() if self.engine else None, "set_ts": self.set_ts,
                 "set_equity": self._set_equity, "day": self.day, "day_start_equity": self.day_start_equity,
                 "reconfigs_today": self.reconfigs_today, "halted_day": self.halted_day,
-                "closed": [self.closed_cycles, self.closed_profit, self.closed_fees]}
+                "closed": [self.closed_cycles, self.closed_profit, self.closed_fees],
+                "day_start_fees": self.day_start_fees, "memory": self.memory.to_dict()}
 
     @classmethod
-    def from_dict(cls, d: dict, cfg: GridRiskConfig) -> "GridAgent":
+    def from_dict(cls, d: dict, cfg: GridRiskConfig, learn: bool = True) -> "GridAgent":
         try:
-            a = cls(float(d["initial"]), cfg, float(d["cfg_fee"]), float(d["cfg_slippage"]))
+            a = cls(float(d["initial"]), cfg, float(d["cfg_fee"]), float(d["cfg_slippage"]), learn)
             a.cash = float(d["cash"])
             a.engine = GridEngine.from_dict(d["engine"]) if d["engine"] else None
             a.set_ts, a._set_equity = float(d["set_ts"]), float(d["set_equity"])
@@ -230,6 +267,8 @@ class GridAgent:
             a.reconfigs_today, a.halted_day = int(d["reconfigs_today"]), str(d["halted_day"])
             cc, cp, cf = d["closed"]
             a.closed_cycles, a.closed_profit, a.closed_fees = int(cc), float(cp), float(cf)
+            a.day_start_fees = float(d.get("day_start_fees", a.totals()["fees"]))
+            a.memory = LearningMemory.from_dict(d.get("memory"))  # 舊版狀態檔沒有學習紀錄
         except (KeyError, TypeError, ValueError) as ex:
             raise ValueError(f"網格狀態檔格式錯誤:{ex!r}") from ex
         return a
@@ -260,6 +299,7 @@ class GridReplayResult:
     cycles: int
     grid_profit: float
     fees: float
+    reflections: int  # 成功的每日檢討次數
     stopped_early: bool
 
 
@@ -274,7 +314,7 @@ def grid_replay(model, symbol: str, interval: str, candles: List[Candle], agent:
     start = MIN_BARS - 1
     start_price = end_price = candles[start + 1].open
     peak, max_dd = agent.equity(start_price), 0.0
-    decisions = errors = sets = pauses = stops = grid_fills = processed = 0
+    decisions = errors = sets = pauses = stops = grid_fills = processed = reflections = 0
     stopped = False
     prev_close = candles[start].close
 
@@ -302,6 +342,7 @@ def grid_replay(model, symbol: str, interval: str, candles: List[Candle], agent:
             errors += 1 if rec["error"] else 0
             sets += rec["code"] == "set"
             pauses += rec["code"] == "pause"
+            reflections += 1 if rec["reflection"] and not rec["reflection"]["error"] else 0
         for p in candle_path(nxt.open, nxt.high, nxt.low, nxt.close)[1:]:
             tick(p, nxt.ts, False)
         prev_close = end_price = nxt.close
@@ -310,4 +351,4 @@ def grid_replay(model, symbol: str, interval: str, candles: List[Candle], agent:
     t = agent.totals()
     return GridReplayResult(processed, start_price, end_price, eq, (eq / agent.initial - 1) * 100,
                             (end_price / start_price - 1) * 100, max_dd * 100, decisions, errors, sets, pauses,
-                            stops, grid_fills, t["cycles"], t["grid_profit"], t["fees"], stopped)
+                            stops, grid_fills, t["cycles"], t["grid_profit"], t["fees"], reflections, stopped)

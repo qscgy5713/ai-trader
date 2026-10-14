@@ -8,6 +8,8 @@
 - [x] 單元測試(26 個,Gemini 以模擬 HTTP 測試)
 - [x] 實際呼叫 Gemini 驗證(`once`):儲值後成功
 - [x] AI 調整網格模式(grid / grid-replay、網格報表)
+- [x] 網格模式學習:最近決策結果 + 每日檢討心得(`--no-learn` 可關閉)
+- [ ] 學習版與 `--no-learn` 版同時跑一到兩週,比較報表
 - [ ] 讓 Gemini 網格模擬盤跑一到兩週,和規則基準、固定網格比較
 - [ ] Gemini 與規則基準的對照報告(同一段行情、同樣風控)
 - [ ] 斷線警報 / 通知(可參考 crypto-grid-bot 的 Watchdog)

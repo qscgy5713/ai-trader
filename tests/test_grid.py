@@ -9,7 +9,9 @@ from unittest import mock
 
 from aitrader.grid import GridConfig, GridEngine, max_grids_for_spacing, spacing_pct
 from aitrader.grid_agent import GridAgent, GridRiskConfig, grid_replay
-from aitrader.llm import GRID_SCHEMA, GeminiModel, GridDecision, LLMError, RuleGridModel, parse_grid_decision
+from aitrader.llm import (GRID_SCHEMA, MAX_LESSONS, REFLECTION_SCHEMA, CachedModel, GeminiModel, GridDecision,
+                          LLMError, Reflection, RuleGridModel, parse_grid_decision, parse_reflection)
+from aitrader.memory import HISTORY_LEN, LearningMemory
 from tests.test_aitrader import FakeTime, _ok, _Resp, candles
 
 META = {"model": "f", "latency_s": 0, "tokens_in": 1, "tokens_out": 1}
@@ -284,3 +286,162 @@ class GridCliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LearningModel(SeqModel):
+    """可做每日檢討的假模型。"""
+
+    can_reflect = True
+
+    def __init__(self, *decisions, reflections=None):
+        super().__init__(*decisions)
+        self.reflections = list(reflections or [])
+        self.reflect_calls = []
+
+    def reflect(self, system, prompt):
+        self.reflect_calls.append(prompt)
+        r = self.reflections.pop(0) if self.reflections else Reflection("ok", ["盤整時維持網格"])
+        if isinstance(r, Exception):
+            raise r
+        return r, META
+
+
+class LearningTest(unittest.TestCase):
+    def agent(self, learn=True, **kw):
+        return GridAgent(10000, GridRiskConfig(**kw), fee=0.001, slippage=0.0005, learn=learn)
+
+    def test_memory_outcome_and_day_review(self):
+        m = LearningMemory()
+        m.record_decision(TS, 100, 1000, {"action": "SET", "lower_pct": 3, "upper_pct": 2, "grids": 8,
+                                           "confidence": 0.8, "reason": "r"}, "set")
+        m.on_tick(3, None)
+        m.on_tick(0, "stop_loss")
+        m.settle(TS + 7200, 98, 990)
+        e = m.history[-1]
+        self.assertEqual(e["params"], "-3%/+2% 8 grids")
+        self.assertEqual(e["events"], ["stop_loss"])
+        self.assertEqual(e["outcome"], {"hours": 2.0, "price_change_pct": -2.0, "equity_change_pct": -1.0,
+                                        "grid_fills": 3})
+        m.roll_day("2023-11-14", TS + 9000, 98, 990, 1000, 2.0)
+        self.assertEqual(m.review["grid_fills"], 3)
+        self.assertEqual(m.review["forced_exits"], ["stop_loss"])
+        self.assertEqual(len(m.review["decisions"]), 1)
+        self.assertEqual(m.day_log, [])
+        for i in range(20):
+            m.record_decision(TS + i, 100, 1000, None, "no_decision")
+            m.settle(TS + i + 1, 100, 1000)
+        self.assertEqual(len(m.history), HISTORY_LEN)
+        r = LearningMemory.from_dict(json.loads(json.dumps(m.to_dict())))
+        self.assertEqual(r.to_dict(), m.to_dict())
+        self.assertEqual(LearningMemory.from_dict(None).history, [])  # 舊版狀態檔
+
+    def test_model_errors_not_recorded_in_history(self):
+        a, cs = self.agent(), candles()
+        m = LearningModel(LLMError("x"), LLMError("x"), SET())
+        for i in range(4):
+            a.decide(m, "X", "1h", cs, 100, TS + i * 60)
+        self.assertEqual([e["action"] for e in a.memory.history], ["SET"])
+
+    def test_prompt_contains_memory_only_when_learning(self):
+        cs = candles()
+        for learn in (True, False):
+            a, m = self.agent(learn), LearningModel(SET())
+            a.decide(m, "X", "1h", cs, 100, TS)
+            a.decide(m, "X", "1h", cs, 100.5, TS + 3600)
+            self.assertNotIn("memory", m.calls[0])  # 第一次還沒有紀錄
+            self.assertEqual("recent_decisions_with_outcomes" in m.calls[1], learn)
+
+    def test_daily_reflection_updates_lessons(self):
+        cs = candles()
+        a = self.agent()
+        m = LearningModel(SET(), reflections=[LLMError("暫時"), Reflection("今天盤整", ["格數別太多", "", 5])])
+        day0 = TS - TS % 86400 + 3600
+        a.decide(m, "X", "1h", cs, 100, day0)
+        a.on_price(97, day0 + 60)
+        a.decide(m, "X", "1h", cs, 99, day0 + 3600)
+        self.assertEqual(m.reflect_calls, [])  # 同一天不檢討
+        r = a.decide(m, "X", "1h", cs, 99, day0 + 86400)  # 換日:檢討失敗,不影響決策
+        self.assertTrue(r["reflection"]["error"])
+        self.assertIsNotNone(r["decision"])
+        self.assertIn("grid_fills", m.reflect_calls[0])
+        r = a.decide(m, "X", "1h", cs, 99, day0 + 86400 + 3600)  # 下一次決策重試成功
+        self.assertEqual(r["reflection"]["lessons"], ["格數別太多"])  # 空字串與非字串被濾掉
+        self.assertEqual(a.memory.lessons, ["格數別太多"])
+        r = a.decide(m, "X", "1h", cs, 99, day0 + 86400 + 7200)
+        self.assertIsNone(r["reflection"])  # 同一天只檢討一次
+        self.assertIn("格數別太多", m.calls[-1])  # 心得放進之後的決策提示詞
+
+    def test_reflection_gives_up_after_retries_and_skips_without_support(self):
+        cs = candles()
+        a = self.agent()
+        m = LearningModel(reflections=[LLMError("x")] * 5)
+        day0 = TS - TS % 86400
+        a.decide(m, "X", "1h", cs, 100, day0)
+        for i in range(5):
+            a.decide(m, "X", "1h", cs, 100, day0 + 86400 + i)
+        self.assertEqual(len(m.reflect_calls), 3)
+        b, rule = self.agent(), RuleGridModel()  # 規則模型不支援檢討:略過
+        b.decide(rule, "X", "1h", cs, 100, day0)
+        self.assertIsNone(b.decide(rule, "X", "1h", cs, 100, day0 + 86400)["reflection"])
+        c, m2 = self.agent(learn=False), LearningModel()
+        c.decide(m2, "X", "1h", cs, 100, day0)
+        c.decide(m2, "X", "1h", cs, 100, day0 + 86400)
+        self.assertEqual(m2.reflect_calls, [])
+
+    def test_agent_state_keeps_memory_and_reads_old_state(self):
+        cs = candles()
+        a = self.agent()
+        a.decide(LearningModel(SET()), "X", "1h", cs, 100, TS)
+        a.memory.lessons = ["心得"]
+        d = json.loads(json.dumps(a.to_dict()))
+        b = GridAgent.from_dict(d, GridRiskConfig())
+        self.assertEqual(b.memory.lessons, ["心得"])
+        self.assertIsNotNone(b.memory.pending)
+        del d["memory"], d["day_start_fees"]
+        self.assertEqual(GridAgent.from_dict(d, GridRiskConfig()).memory.lessons, [])
+
+    def test_parse_reflection_and_gemini_and_cache(self):
+        with self.assertRaises(LLMError):
+            parse_reflection('{"summary":"x"}')
+        r = parse_reflection(json.dumps({"summary": "s", "lessons": [f"l{i}" for i in range(9)]}))
+        self.assertEqual(len(r.lessons), MAX_LESSONS)
+        g = GeminiModel("k", "m", schema=GRID_SCHEMA, parser=parse_grid_decision)
+        with mock.patch("aitrader.llm.urllib.request.urlopen",
+                        return_value=_Resp(_ok('{"summary":"s","lessons":["a"]}'))) as u:
+            r, _ = g.reflect("sys", "p")
+        self.assertEqual(json.loads(u.call_args[0][0].data)["generationConfig"]["responseSchema"], REFLECTION_SCHEMA)
+        self.assertEqual(r.lessons, ["a"])
+        with tempfile.TemporaryDirectory() as t:
+            inner = LearningModel()
+            c = CachedModel(inner, t, GridDecision)
+            self.assertTrue(c.can_reflect)
+            c.reflect("s", "p")
+            r, meta = c.reflect("s", "p")
+            self.assertEqual(len(inner.reflect_calls), 1)
+            self.assertTrue(meta["cached"])
+            self.assertIsInstance(r, Reflection)
+            self.assertFalse(CachedModel(RuleGridModel(), t).can_reflect)
+
+    def test_cli_no_learn_uses_separate_files_and_report_shows_lessons(self):
+        from aitrader.cli import main
+        with tempfile.TemporaryDirectory() as t:
+            cwd = os.getcwd()
+            os.chdir(t)
+            try:
+                with mock.patch("aitrader.grid_cli.fetch_klines", return_value=candles()), \
+                        mock.patch("aitrader.grid_cli.fetch_price", return_value=100.0), \
+                        mock.patch("aitrader.grid_cli.time", FakeTime()), \
+                        mock.patch("aitrader.grid_cli._make_model", return_value=LearningModel(SET())), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(["grid", "--no-learn", "--max-steps", "1"]), 0)
+                self.assertTrue(os.path.exists("state/grid_BTCUSDT_gemini_nolearn.json"))
+                j = "journal/grid_BTCUSDT_gemini_nolearn.jsonl"
+                with open(j, "a") as fh:
+                    fh.write(json.dumps({"kind": "grid_reflection", "ts": TS, "day": "2023-11-14", "summary": "盤整",
+                                         "lessons": ["別太常重設"], "meta": META, "error": None}) + "\n")
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(main(["report", j]), 0)
+            finally:
+                os.chdir(cwd)
+        self.assertIn("別太常重設", out.getvalue())
+        self.assertIn("最後權益", out.getvalue())
