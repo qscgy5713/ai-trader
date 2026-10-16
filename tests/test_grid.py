@@ -445,3 +445,25 @@ class LearningTest(unittest.TestCase):
                 os.chdir(cwd)
         self.assertIn("別太常重設", out.getvalue())
         self.assertIn("最後權益", out.getvalue())
+
+
+class GridKeepLessonsTest(unittest.TestCase):
+    def test_grid_reset_keeps_lessons(self):
+        from aitrader.cli import main
+        with tempfile.TemporaryDirectory() as t, \
+                mock.patch("aitrader.grid_cli.fetch_klines", return_value=candles()), \
+                mock.patch("aitrader.grid_cli.fetch_price", return_value=100.0), \
+                mock.patch("aitrader.grid_cli.time", FakeTime()), \
+                mock.patch("aitrader.grid_cli._make_model", return_value=SeqModel(SET())), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            s = os.path.join(t, "s.json")
+            args = ["grid", "--state", s, "--journal", os.path.join(t, "j.jsonl"), "--max-steps", "1"]
+            main(args)
+            d = json.load(open(s))
+            d["agent"]["memory"]["lessons"] = ["格數別太多"]
+            json.dump(d, open(s, "w"))
+            main(args + ["--reset"])
+            self.assertEqual(json.load(open(s))["agent"]["memory"]["lessons"], ["格數別太多"])
+            main(args + ["--reset", "--reset-memory"])
+            self.assertEqual(json.load(open(s))["agent"]["memory"]["lessons"], [])
+        self.assertIn("沿用先前的 1 條心得", out.getvalue())

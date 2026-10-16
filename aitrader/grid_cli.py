@@ -16,7 +16,7 @@ from .llm import (GRID_SCHEMA, CachedModel, GeminiModel, GridDecision, LLMConfig
 from .market import MIN_BARS, fetch_klines, fetch_price
 from .memory import format_reflection
 from .runtime import INTERVAL_SECS, StopFlag, handle_signals, wait
-from .state import acquire_lock, archive_journal, append_jsonl, load_json, save_json
+from .state import acquire_lock, archive_journal, old_lessons, append_jsonl, load_json, save_json
 
 FETCH_BARS = 120
 BAR_RETRIES = 3  # 模型暫時失敗時,同一根 K 線最多重試幾次
@@ -84,6 +84,8 @@ EVENT_NAMES = {"stop_loss": "觸發停損,清倉並停機到明天(UTC)", "daily
 # ------------------------------ grid(模擬盤) ------------------------------
 
 def cmd_grid(a) -> int:
+    if a.reset_memory and not a.reset:
+        raise ValueError("--reset-memory 需搭配 --reset 使用")
     rc = _risk_cfg(a)
     if a.interval not in INTERVAL_SECS:
         raise ValueError(f"--interval 只支援 {', '.join(INTERVAL_SECS)}")
@@ -110,7 +112,11 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
         last_bar = d.get("last_bar_ts", 0)
         print(f"[grid] 接續 {path}:網格 {_fmt_grid(agent.grid_info(agent.engine.last_price, time.time()) if agent.engine else None)}")
     else:
+        carried = old_lessons(path, a)  # 心得是對行情與策略的經驗,重開帳戶預設沿用
         agent, last_bar = _new_agent(a, rc), 0
+        if carried:
+            agent.memory.lessons = carried
+            print(f"[grid] 沿用先前的 {len(carried)} 條心得(要連心得一起清除請加 --reset-memory)")
         archived = archive_journal(journal)  # 新帳戶:舊日誌封存,report 只看目前帳戶
         if archived:
             print(f"[grid] 舊的決策日誌已封存為 {archived}")
@@ -316,7 +322,8 @@ def add_parsers(sub) -> None:
     p.add_argument("--tick", type=float, default=5, help="更新價格、撮合網格的間隔秒數(預設 5)")
     p.add_argument("--state", help="狀態檔(預設 state/grid_<SYMBOL>_<MODEL>[_nolearn].json)")
     p.add_argument("--journal", help="決策日誌(預設 journal/grid_<SYMBOL>_<MODEL>[_nolearn].jsonl)")
-    p.add_argument("--reset", action="store_true", help="忽略既有狀態,重新開始")
+    p.add_argument("--reset", action="store_true", help="忽略既有狀態,重新開始(預設沿用 AI 的心得)")
+    p.add_argument("--reset-memory", action="store_true", help="搭配 --reset:連 AI 的心得也一起清除")
     p.add_argument("--max-steps", type=int, default=0, help="問 AI 幾次後結束,0=持續執行")
     p.set_defaults(fn=cmd_grid)
 

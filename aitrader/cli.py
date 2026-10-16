@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import sys
@@ -265,6 +266,61 @@ def cmd_report(a) -> int:
     return 0
 
 
+# ------------------------------ lessons ------------------------------
+
+def cmd_lessons(a) -> int:
+    """查看 AI 的學習狀況;--import 從日誌最後一次成功的每日檢討匯入心得。"""
+    if not os.path.exists(a.state):
+        raise ValueError(f"找不到狀態檔 {a.state}")
+    d = load_json(a.state)
+    agent = d.get("agent")
+    if not isinstance(agent, dict) or "memory" not in agent:
+        raise ValueError("這個狀態檔沒有學習紀錄(只有 grid / futures 模式有學習)")
+    if a.import_from:
+        lock = acquire_lock(a.state)  # 模擬盤執行中會定時存檔蓋掉修改,必須先停止
+        try:
+            refl = []
+            with open(a.import_from) as fh:
+                for line in fh:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if str(r.get("kind", "")).endswith("_reflection") and not r.get("error") and r.get("lessons"):
+                        refl.append(r)
+            if not refl:
+                raise ValueError(f"{a.import_from} 裡沒有成功的每日檢討紀錄")
+            last = refl[-1]
+            mem = agent["memory"] or {}
+            mem["lessons"], mem["lessons_updated"] = list(last["lessons"]), last["day"]
+            agent["memory"] = mem
+            save_json(a.state, d)
+            print(f"已從 {a.import_from}({last['day']} 的檢討)匯入 {len(last['lessons'])} 條心得")
+        finally:
+            if lock:
+                lock.close()
+    mem = agent["memory"] or {}
+    lessons = mem.get("lessons") or []
+    print(f"{a.state}:{d.get('symbol')} {d.get('interval')} {d.get('model')}")
+    print(f"心得 {len(lessons)} 條" + (f"(最近一次檢討:{mem.get('lessons_updated')})" if mem.get("lessons_updated") else ""))
+    for i, x in enumerate(lessons, 1):
+        print(f"  {i}. {x}")
+    hist = mem.get("history") or []
+    print(f"成績單 {len(hist)} 筆(每次決策附給 AI 參考)" + ("" if not hist else ":"))
+    for e in hist:
+        o = e.get("outcome", {})
+        ev = f"  事件 {','.join(e['events'])}" if e.get("events") else ""
+        try:  # 紀錄存 UTC,顯示本地時間
+            when = time.strftime("%m-%d %H:%M", time.localtime(calendar.timegm(time.strptime(e["time_utc"], "%Y-%m-%d %H:%M"))))
+        except (ValueError, KeyError):
+            when = e.get("time_utc", "?")
+        print(f"  {when} {e['action']:5} {e.get('params') or '':10} → {o.get('hours')}h 價格 {o.get('price_change_pct'):+}%"
+              f" 權益 {o.get('equity_change_pct'):+}%{ev}")
+    review = mem.get("review")
+    print("待檢討:" + (f"{review['day_utc']}(下一次決策時進行)" if review else "無(UTC 換日後的第一次決策會檢討前一天)"))
+    return 0
+
+
 # ------------------------------ main ------------------------------
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -316,6 +372,12 @@ def main(argv=None) -> int:
     add_grid_parsers(sub)
     from .futures_cli import add_parsers as add_futures_parsers
     add_futures_parsers(sub)
+
+    p = sub.add_parser("lessons", help="查看 AI 的學習狀況(心得、成績單);可從日誌匯入心得")
+    p.add_argument("state", help="狀態檔,如 state/futures_SOLUSDT_gemini.json")
+    p.add_argument("--import", dest="import_from", metavar="JOURNAL",
+                   help="從日誌最後一次成功的每日檢討匯入心得(需先停止該模擬盤)")
+    p.set_defaults(fn=cmd_lessons)
 
     p = sub.add_parser("report", help="檢視決策日誌(一般、網格、合約模式皆可)")
     p.add_argument("journal", help="日誌路徑,如 journal/paper_BTCUSDT_gemini.jsonl")

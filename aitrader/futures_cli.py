@@ -17,7 +17,7 @@ from .llm import (FUTURES_SCHEMA, CachedModel, FuturesDecision, GeminiModel, LLM
 from .market import MIN_BARS, fetch_funding_history, fetch_klines, fetch_premium
 from .memory import format_reflection
 from .runtime import INTERVAL_SECS, StopFlag, handle_signals, parse_duration, wait
-from .state import acquire_lock, archive_journal, load_json, save_json
+from .state import acquire_lock, archive_journal, old_lessons, load_json, save_json
 
 FETCH_BARS = 120
 BAR_RETRIES = 3
@@ -131,6 +131,8 @@ def _fmt_rec(rec: dict) -> str:
 # ------------------------------ futures(模擬盤) ------------------------------
 
 def cmd_futures(a) -> int:
+    if a.reset_memory and not a.reset:
+        raise ValueError("--reset-memory 需搭配 --reset 使用")
     a.status_secs = parse_duration(a.status_every)
     if 0 < a.status_secs < 5:
         raise ValueError("--status-every 最短 5 秒(設 0 關閉)")
@@ -163,7 +165,11 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
         last_bar, next_funding = d.get("last_bar_ts", 0), d.get("next_funding_ts", 0)
         print(f"[futures] 接續 {path}")
     else:
+        carried = old_lessons(path, a)  # 心得是對行情與策略的經驗,重開帳戶預設沿用
         agent, last_bar, next_funding = _new_agent(a, rc, money), 0, 0
+        if carried:
+            agent.memory.lessons = carried
+            print(f"[futures] 沿用先前的 {len(carried)} 條心得(要連心得一起清除請加 --reset-memory)")
         archived = archive_journal(journal)  # 新帳戶:舊日誌封存,report 只看目前帳戶
         if archived:
             print(f"[futures] 舊的決策日誌已封存為 {archived}")
@@ -408,7 +414,8 @@ def add_parsers(sub) -> None:
                    help="兩次決策之間顯示狀態列(價格、持倉、未實現損益、剩餘額度)的間隔,如 5s、5m、1h;0=不顯示(預設 5m)")
     p.add_argument("--state", help="狀態檔(預設 state/futures_<SYMBOL>_<MODEL>[_nolearn].json)")
     p.add_argument("--journal", help="決策日誌(預設 journal/futures_<SYMBOL>_<MODEL>[_nolearn].jsonl)")
-    p.add_argument("--reset", action="store_true", help="忽略既有狀態,重新開始")
+    p.add_argument("--reset", action="store_true", help="忽略既有狀態,重新開始(預設沿用 AI 的心得)")
+    p.add_argument("--reset-memory", action="store_true", help="搭配 --reset:連 AI 的心得也一起清除")
     p.add_argument("--max-steps", type=int, default=0, help="問 AI 幾次後結束,0=持續執行")
     p.set_defaults(fn=cmd_futures)
 

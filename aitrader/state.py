@@ -73,3 +73,14 @@ def archive_journal(path: str) -> Optional[str]:
         n += 1
     os.replace(path, dest)
     return dest
+
+
+def old_lessons(path: str, a) -> list:
+    """開新帳戶時要沿用的心得:舊狀態檔裡的心得;--reset-memory 時不沿用。讀不到就回空清單。"""
+    if getattr(a, "reset_memory", False) or not os.path.exists(path):
+        return []
+    try:
+        mem = (load_json(path).get("agent") or {}).get("memory") or {}
+        return [str(x) for x in mem.get("lessons") or []]
+    except (ValueError, OSError, AttributeError):
+        return []

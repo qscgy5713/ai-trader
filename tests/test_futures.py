@@ -539,3 +539,67 @@ class ArchiveJournalTest(unittest.TestCase):
             self.assertEqual(len(files), 2)  # 新日誌 + 封存檔
             self.assertLess(sum(1 for _ in open(j)), n_before)
             self.assertIn("已封存", out.getvalue())
+
+
+class KeepLessonsTest(unittest.TestCase):
+    def _run(self, t, extra, model=None):
+        from aitrader.cli import main
+        ft = FakeTime()
+        with mock.patch("aitrader.futures_cli.fetch_klines", return_value=candles()), \
+                mock.patch("aitrader.futures_cli.fetch_premium", return_value=(100.0, 0.0, ft.now + 10 ** 6)), \
+                mock.patch("aitrader.futures_cli.time", ft), \
+                mock.patch("aitrader.futures_cli._make_model", return_value=model or SeqModel(D("LONG", 1))), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["futures", "--state", os.path.join(t, "s.json"), "--journal", os.path.join(t, "j.jsonl"),
+                       "--max-steps", "1"] + extra)
+        return rc, out.getvalue()
+
+    def _set_lessons(self, t, lessons):
+        p = os.path.join(t, "s.json")
+        d = json.load(open(p))
+        d["agent"]["memory"]["lessons"] = lessons
+        json.dump(d, open(p, "w"))
+
+    def _lessons(self, t):
+        return json.load(open(os.path.join(t, "s.json")))["agent"]["memory"]["lessons"]
+
+    def test_reset_keeps_lessons_unless_reset_memory(self):
+        with tempfile.TemporaryDirectory() as t:
+            self._run(t, [])
+            self._set_lessons(t, ["槓桿別太高"])
+            rc, out = self._run(t, ["--reset"])
+            self.assertEqual(rc, 0)
+            self.assertIn("沿用先前的 1 條心得", out)
+            self.assertEqual(self._lessons(t), ["槓桿別太高"])
+            d = json.load(open(os.path.join(t, "s.json")))
+            self.assertEqual(len(d["agent"]["memory"]["history"]), 0)  # 成績單重來(只有 pending)
+            self.assertEqual(self._run(t, ["--reset-memory"])[0], 2)  # 需搭配 --reset
+            self._run(t, ["--reset", "--reset-memory"])
+            self.assertEqual(self._lessons(t), [])
+
+    def test_lessons_command_show_and_import(self):
+        from aitrader.cli import main
+        with tempfile.TemporaryDirectory() as t:
+            self._run(t, [])
+            j = os.path.join(t, "old.jsonl")
+            with open(j, "w") as fh:
+                fh.write(json.dumps({"kind": "futures_reflection", "ts": TS, "day": "2026-10-14", "summary": "s",
+                                     "lessons": ["舊的"], "error": None}) + "\n")
+                fh.write(json.dumps({"kind": "futures_reflection", "ts": TS, "day": "2026-10-15", "summary": "s",
+                                     "lessons": ["少反手", "槓桿 1.5 倍內"], "error": None}) + "\n")
+                fh.write(json.dumps({"kind": "futures_reflection", "ts": TS, "day": "2026-10-16", "summary": None,
+                                     "lessons": None, "error": "x"}) + "\n")
+            s = os.path.join(t, "s.json")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(main(["lessons", s, "--import", j]), 0)
+            self.assertEqual(self._lessons(t), ["少反手", "槓桿 1.5 倍內"])  # 最後一次「成功」的檢討
+            self.assertIn("2026-10-15", out.getvalue())
+            self.assertIn("成績單", out.getvalue())
+            from aitrader.state import acquire_lock
+            lk = acquire_lock(s)  # 模擬盤執行中:拒絕匯入
+            try:
+                with contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(["lessons", s, "--import", j]), 2)
+                self.assertIn("另一個行程", err.getvalue())
+            finally:
+                lk.close()
