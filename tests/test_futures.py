@@ -595,11 +595,37 @@ class KeepLessonsTest(unittest.TestCase):
             self.assertEqual(self._lessons(t), ["少反手", "槓桿 1.5 倍內"])  # 最後一次「成功」的檢討
             self.assertIn("2026-10-15", out.getvalue())
             self.assertIn("成績單", out.getvalue())
+            from aitrader.memory import pending_lessons_path
             from aitrader.state import acquire_lock
-            lk = acquire_lock(s)  # 模擬盤執行中:拒絕匯入
+            self._set_lessons(t, [])
+            lk = acquire_lock(s)  # 模擬盤執行中:排入暫存檔,不直接改狀態檔
             try:
-                with contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(main(["lessons", s, "--import", j]), 2)
-                self.assertIn("另一個行程", err.getvalue())
+                with contextlib.redirect_stdout(io.StringIO()) as out2:
+                    self.assertEqual(main(["lessons", s, "--import", j]), 0)
+                self.assertIn("已排入 2 條心得", out2.getvalue())
+                self.assertTrue(os.path.exists(pending_lessons_path(s)))
+                self.assertEqual(self._lessons(t), [])
             finally:
                 lk.close()
+            rc, out3 = self._run(t, [])  # 執行中的程式(這裡用接續模擬)下一輪套用
+            self.assertIn("已套用匯入的心得 2 條", out3)
+            self.assertEqual(self._lessons(t), ["少反手", "槓桿 1.5 倍內"])
+            self.assertFalse(os.path.exists(pending_lessons_path(s)))
+
+    def test_apply_pending_keeps_review_and_rejects_bad_file(self):
+        from aitrader.memory import LearningMemory, apply_pending_lessons, pending_lessons_path
+        with tempfile.TemporaryDirectory() as t:
+            s = os.path.join(t, "s.json")
+            m = LearningMemory()
+            m.review = {"day_utc": "2026-10-16"}
+            self.assertIsNone(apply_pending_lessons(s, m))
+            with open(pending_lessons_path(s), "w") as fh:
+                json.dump({"lessons": ["a", "", "b"], "day": "2026-10-15"}, fh)
+            self.assertEqual(apply_pending_lessons(s, m), 2)
+            self.assertEqual(m.lessons, ["a", "b"])
+            self.assertEqual(m.review, {"day_utc": "2026-10-16"})  # 待檢討不受影響
+            with open(pending_lessons_path(s), "w") as fh:
+                fh.write("{bad")
+            with self.assertRaises(ValueError):
+                apply_pending_lessons(s, m)
+            self.assertFalse(os.path.exists(pending_lessons_path(s)))

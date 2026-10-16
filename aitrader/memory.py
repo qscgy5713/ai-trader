@@ -13,7 +13,9 @@ from typing import List, Optional
 
 from .llm import MAX_LESSONS, LLMConfigError, LLMError
 from .prompt import build_reflection_prompt
-from .state import append_jsonl
+import os
+
+from .state import append_jsonl, load_json
 
 HISTORY_LEN = 8  # 決策時附上最近幾次的結果
 MAX_DAY_LOG = 48  # 一天最多保留幾筆給檢討(防止短週期時提示詞過長)
@@ -162,3 +164,28 @@ def format_reflection(r: dict) -> str:
     lines = [f"每日檢討({r['day']}):{r['summary']}", "    目前心得:"]
     lines += [f"    {i}. {x}" for i, x in enumerate(r["lessons"], 1)] or ["    (無)"]
     return "\n".join(lines)
+
+
+def pending_lessons_path(state_path: str) -> str:
+    """模擬盤執行中匯入的心得先寫到這裡,由執行中的程式套用。"""
+    return state_path + ".lessons-import.json"
+
+
+def apply_pending_lessons(state_path: str, memory: LearningMemory) -> Optional[int]:
+    """有待套用的心得就套用並刪除暫存檔,回傳套用的條數;沒有則回 None。檔案壞掉會刪除並丟 ValueError。"""
+    p = pending_lessons_path(state_path)
+    if not os.path.exists(p):
+        return None
+    try:
+        d = load_json(p)
+        lessons = d["lessons"]
+        if not isinstance(lessons, list):
+            raise ValueError("lessons 必須是陣列")
+        review, attempts = memory.review, memory.review_attempts  # set_lessons 會清掉待檢討;匯入不應影響
+        memory.set_lessons(lessons, str(d.get("day", "")))
+        memory.review, memory.review_attempts = review, attempts
+    except (KeyError, ValueError) as e:
+        os.remove(p)
+        raise ValueError(f"待套用的心得檔格式錯誤,已刪除:{e}") from None
+    os.remove(p)
+    return len(memory.lessons)

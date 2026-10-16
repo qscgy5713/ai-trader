@@ -15,7 +15,8 @@ from .market import MIN_BARS, fetch_klines, fetch_price
 from .portfolio import Portfolio
 from .risk import RiskConfig, RiskManager
 from .runtime import INTERVAL_SECS, StopFlag, handle_signals, wait
-from .state import acquire_lock, archive_journal, load_json, save_json
+from .memory import pending_lessons_path
+from .state import acquire_lock, archive_journal, load_json, save_json, try_lock
 
 FETCH_BARS = 120  # 每次決策抓的 K 線數(>= MIN_BARS)
 BAR_RETRIES = 3  # 模型暫時失敗時,同一根 K 線最多重試幾次(間隔 --check-every)
@@ -268,6 +269,22 @@ def cmd_report(a) -> int:
 
 # ------------------------------ lessons ------------------------------
 
+def _last_reflection(journal: str) -> dict:
+    """日誌裡最後一次成功(有心得)的每日檢討。"""
+    refl = []
+    with open(journal) as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if str(r.get("kind", "")).endswith("_reflection") and not r.get("error") and r.get("lessons"):
+                refl.append(r)
+    if not refl:
+        raise ValueError(f"{journal} 裡沒有成功的每日檢討紀錄")
+    return refl[-1]
+
+
 def cmd_lessons(a) -> int:
     """查看 AI 的學習狀況;--import 從日誌最後一次成功的每日檢討匯入心得。"""
     if not os.path.exists(a.state):
@@ -277,20 +294,17 @@ def cmd_lessons(a) -> int:
     if not isinstance(agent, dict) or "memory" not in agent:
         raise ValueError("這個狀態檔沒有學習紀錄(只有 grid / futures 模式有學習)")
     if a.import_from:
-        lock = acquire_lock(a.state)  # 模擬盤執行中會定時存檔蓋掉修改,必須先停止
+        last = _last_reflection(a.import_from)
+        lock = try_lock(a.state)
+        if lock is False:  # 模擬盤執行中:排入暫存檔,由執行中的程式套用(直接改狀態檔會被定時存檔蓋掉)
+            save_json(pending_lessons_path(a.state), {"lessons": last["lessons"], "day": last["day"],
+                                                     "source": a.import_from})
+            print(f"模擬盤執行中:已排入 {len(last['lessons'])} 條心得({last['day']} 的檢討),"
+                  "執行中的程式下一輪檢查(數十秒內)會自動套用,畫面會顯示「已套用匯入的心得」")
+            for i, x in enumerate(last["lessons"], 1):
+                print(f"  {i}. {x}")
+            return 0
         try:
-            refl = []
-            with open(a.import_from) as fh:
-                for line in fh:
-                    try:
-                        r = json.loads(line)
-                    except ValueError:
-                        continue
-                    if str(r.get("kind", "")).endswith("_reflection") and not r.get("error") and r.get("lessons"):
-                        refl.append(r)
-            if not refl:
-                raise ValueError(f"{a.import_from} 裡沒有成功的每日檢討紀錄")
-            last = refl[-1]
             mem = agent["memory"] or {}
             mem["lessons"], mem["lessons_updated"] = list(last["lessons"]), last["day"]
             agent["memory"] = mem
@@ -316,6 +330,8 @@ def cmd_lessons(a) -> int:
             when = e.get("time_utc", "?")
         print(f"  {when} {e['action']:5} {e.get('params') or '':10} → {o.get('hours')}h 價格 {o.get('price_change_pct'):+}%"
               f" 權益 {o.get('equity_change_pct'):+}%{ev}")
+    if os.path.exists(pending_lessons_path(a.state)):
+        print("另有待套用的匯入心得(執行中的模擬盤下一輪會套用)")
     review = mem.get("review")
     print("待檢討:" + (f"{review['day_utc']}(下一次決策時進行)" if review else "無(UTC 換日後的第一次決策會檢討前一天)"))
     return 0
@@ -376,7 +392,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("lessons", help="查看 AI 的學習狀況(心得、成績單);可從日誌匯入心得")
     p.add_argument("state", help="狀態檔,如 state/futures_SOLUSDT_gemini.json")
     p.add_argument("--import", dest="import_from", metavar="JOURNAL",
-                   help="從日誌最後一次成功的每日檢討匯入心得(需先停止該模擬盤)")
+                   help="從日誌最後一次成功的每日檢討匯入心得;模擬盤執行中也可以(會在下一輪自動套用)")
     p.set_defaults(fn=cmd_lessons)
 
     p = sub.add_parser("report", help="檢視決策日誌(一般、網格、合約模式皆可)")

@@ -84,3 +84,11 @@ def old_lessons(path: str, a) -> list:
         return [str(x) for x in mem.get("lessons") or []]
     except (ValueError, OSError, AttributeError):
         return []
+
+
+def try_lock(path: str):
+    """和 acquire_lock 相同,但已被占用時回 False(而不是丟例外);不支援檔案鎖的平台回 None。"""
+    try:
+        return acquire_lock(path)
+    except ValueError:
+        return False

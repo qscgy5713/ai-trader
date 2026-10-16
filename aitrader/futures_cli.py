@@ -15,7 +15,7 @@ from .futures_agent import FuturesAgent, FuturesRiskConfig, futures_replay
 from .llm import (FUTURES_SCHEMA, CachedModel, FuturesDecision, GeminiModel, LLMConfigError, LLMError,
                   RuleFuturesModel, parse_futures_decision)
 from .market import MIN_BARS, fetch_funding_history, fetch_klines, fetch_premium
-from .memory import format_reflection
+from .memory import apply_pending_lessons, format_reflection
 from .runtime import INTERVAL_SECS, StopFlag, handle_signals, parse_duration, wait
 from .state import acquire_lock, archive_journal, old_lessons, load_json, save_json
 
@@ -206,6 +206,10 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
             now = time.time()
             try:
                 price, new_rate, nft = fetch_premium(a.symbol)
+                n = apply_pending_lessons(path, agent.memory)  # lessons --import 在執行中排入的心得
+                if n is not None:
+                    save()
+                    print(f"[futures] 已套用匯入的心得 {n} 條,下一次問 AI 起生效" + ("" if agent.learn else "(注意:--no-learn 時心得不會給 AI)"), flush=True)
                 if next_funding and now >= next_funding and rate is not None:
                     # 已過結算時間:以結算前最後看到的預估費率收付(接續時錯過的結算無法得知費率,略過)
                     f = agent.funding(rate, price, next_funding, journal)

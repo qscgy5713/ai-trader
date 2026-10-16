@@ -86,7 +86,7 @@ python3 -m aitrader report journal/futures_BTCUSDT_gemini.jsonl --currency TWD
 | `once` | 用即時行情問一次模型,顯示決策與風控結果。不改任何狀態,適合確認金鑰與模型設定。 |
 | `paper` | 模擬盤。狀態存在 `state/`,重跑相同指令自動接續;Ctrl+C 會在安全點存檔結束(再按一次強制結束)。 |
 | `replay` | 歷史回放。決策後以**下一根 K 線開盤價**成交(避免偷看未來);每根 K 線都檢查停損。Gemini 回覆會快取在 `cache/`,重跑不重複付費。 |
-| `lessons` | 查看 AI 的學習狀況(心得、成績單、待檢討):`lessons state/futures_SOLUSDT_gemini.json`;`--import <日誌>` 從日誌最後一次成功的每日檢討匯入心得(需先停止該模擬盤)。 |
+| `lessons` | 查看 AI 的學習狀況(心得、成績單、待檢討):`lessons state/futures_SOLUSDT_gemini.json`;`--import <日誌>` 從日誌最後一次成功的每日檢討匯入心得;模擬盤執行中也可以,會排入暫存檔,由執行中的程式在下一輪(數十秒內)套用。 |
 | `report` | 統計決策日誌:各種決策次數、成交、已實現損益、手續費、被風控擋下的原因、token 用量、最近決策與理由。網格日誌會自動改用網格報表。 |
 | `grid` | AI 調整網格的模擬盤,說明見下方「AI 調整網格模式」。 |
 | `grid-replay` | AI 調整網格的歷史回放。 |

@@ -14,7 +14,7 @@ from .grid_agent import GridAgent, GridRiskConfig, grid_replay
 from .llm import (GRID_SCHEMA, CachedModel, GeminiModel, GridDecision, LLMConfigError, LLMError, RuleGridModel,
                   parse_grid_decision)
 from .market import MIN_BARS, fetch_klines, fetch_price
-from .memory import format_reflection
+from .memory import apply_pending_lessons, format_reflection
 from .runtime import INTERVAL_SECS, StopFlag, handle_signals, wait
 from .state import acquire_lock, archive_journal, old_lessons, append_jsonl, load_json, save_json
 
@@ -145,6 +145,10 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
             now = time.time()
             try:
                 price = fetch_price(a.symbol)
+                n = apply_pending_lessons(path, agent.memory)  # lessons --import 在執行中排入的心得
+                if n is not None:
+                    save()
+                    print(f"[grid] 已套用匯入的心得 {n} 條,下一次問 AI 起生效" + ("" if agent.learn else "(注意:--no-learn 時心得不會給 AI)"), flush=True)
                 gap = last_tick is not None and now - last_tick > max(3 * a.tick, 30)
                 fills, ev = agent.on_price(price, now, gap)
                 last_tick = now
