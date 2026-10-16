@@ -17,7 +17,7 @@ from .llm import (FUTURES_SCHEMA, CachedModel, FuturesDecision, GeminiModel, LLM
 from .market import MIN_BARS, fetch_funding_history, fetch_klines, fetch_premium
 from .memory import format_reflection
 from .runtime import INTERVAL_SECS, StopFlag, handle_signals, parse_duration, wait
-from .state import acquire_lock, load_json, save_json
+from .state import acquire_lock, archive_journal, load_json, save_json
 
 FETCH_BARS = 120
 BAR_RETRIES = 3
@@ -164,6 +164,9 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
         print(f"[futures] 接續 {path}")
     else:
         agent, last_bar, next_funding = _new_agent(a, rc, money), 0, 0
+        archived = archive_journal(journal)  # 新帳戶:舊日誌封存,report 只看目前帳戶
+        if archived:
+            print(f"[futures] 舊的決策日誌已封存為 {archived}")
         print(f"[futures] 新帳戶:{a.symbol} 模擬保證金 {money.fmt(agent.acct.initial)},"
               f"模型 {getattr(model, 'name', a.model)}")
     print(f"[futures] {_risk_line(a, rc, money)}")

@@ -39,6 +39,9 @@
 
 ## 使用方式
 
+> 模擬盤(`paper` / `grid` / `futures`)重跑相同指令會自動接續;加 `--reset` 或狀態檔不存在時開新帳戶,
+> 舊的決策日誌會自動封存為 `<原檔名>.<時間>.jsonl`,`report` 只會看到目前帳戶。
+
 ```bash
 # 1. 確認金鑰可用:用即時行情問一次 Gemini(只試算,不存檔)
 python3 -m aitrader once

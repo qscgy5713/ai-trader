@@ -14,7 +14,7 @@ from .market import MIN_BARS, fetch_klines, fetch_price
 from .portfolio import Portfolio
 from .risk import RiskConfig, RiskManager
 from .runtime import INTERVAL_SECS, StopFlag, handle_signals, wait
-from .state import acquire_lock, load_json, save_json
+from .state import acquire_lock, archive_journal, load_json, save_json
 
 FETCH_BARS = 120  # 每次決策抓的 K 線數(>= MIN_BARS)
 BAR_RETRIES = 3  # 模型暫時失敗時,同一根 K 線最多重試幾次(間隔 --check-every)
@@ -134,6 +134,9 @@ def _paper_loop(a, rc: RiskConfig, model, path: str, journal: str, stop: StopFla
         print(f"[paper] 接續 {path}:現金 {pf.cash:.2f}  持倉 {pf.qty:.6f}  成交 {len(pf.trades)} 筆")
     else:
         pf, risk, last_bar = _new_portfolio(a), RiskManager(rc), 0
+        archived = archive_journal(journal)  # 新帳戶:舊日誌封存,report 只看目前帳戶
+        if archived:
+            print(f"[paper] 舊的決策日誌已封存為 {archived}")
         print(f"[paper] 新帳戶:{a.symbol} 模擬資金 {a.cash:g},模型 {getattr(model, 'name', a.model)}")
     print(f"[paper] 每根 {a.interval} K 線收盤後問模型,每 {a.check_every:g} 秒檢查停損;決策日誌 {journal};Ctrl+C 結束", flush=True)
 

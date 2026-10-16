@@ -501,3 +501,41 @@ class BudgetWarningTest(unittest.TestCase):
         self.assertIn("--daily-loss-limit 34", w)
         self.assertEqual(_budget_warning(FuturesRiskConfig(daily_loss_limit_pct=40, daily_loss_amount=10000 / 30), 1000, m), "")
         self.assertEqual(_budget_warning(FuturesRiskConfig(), 1000, m), "")
+
+
+class ArchiveJournalTest(unittest.TestCase):
+    def test_archive_helper(self):
+        from aitrader.state import archive_journal
+        with tempfile.TemporaryDirectory() as t:
+            j = os.path.join(t, "j.jsonl")
+            self.assertIsNone(archive_journal(j))  # 不存在
+            open(j, "w").close()
+            self.assertIsNone(archive_journal(j))  # 空檔不封存
+            for _ in range(2):
+                with open(j, "w") as fh:
+                    fh.write("{}\n")
+                dest = archive_journal(j)
+                self.assertTrue(os.path.exists(dest))
+                self.assertFalse(os.path.exists(j))
+            self.assertEqual(len(os.listdir(t)), 2)  # 同一秒兩次封存不互相覆蓋
+
+    def test_reset_archives_but_resume_keeps_journal(self):
+        from aitrader.cli import main
+        ft = FakeTime()
+        with tempfile.TemporaryDirectory() as t, \
+                mock.patch("aitrader.futures_cli.fetch_klines", return_value=candles()), \
+                mock.patch("aitrader.futures_cli.fetch_premium", return_value=(100.0, 0.0, ft.now + 10 ** 6)), \
+                mock.patch("aitrader.futures_cli.time", ft), \
+                mock.patch("aitrader.futures_cli._make_model", return_value=SeqModel(D("LONG", 1))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            j = os.path.join(t, "j.jsonl")
+            args = ["futures", "--state", os.path.join(t, "s.json"), "--journal", j, "--max-steps", "1"]
+            main(args)
+            main(args)  # 接續:日誌保留並繼續寫
+            self.assertEqual(len([f for f in os.listdir(t) if f.startswith("j.")]), 1)
+            n_before = sum(1 for _ in open(j))
+            main(args + ["--reset"])
+            files = [f for f in os.listdir(t) if f.startswith("j.")]
+            self.assertEqual(len(files), 2)  # 新日誌 + 封存檔
+            self.assertLess(sum(1 for _ in open(j)), n_before)
+            self.assertIn("已封存", out.getvalue())

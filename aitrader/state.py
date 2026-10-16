@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from typing import Optional
 
 try:
     import fcntl
@@ -56,3 +58,18 @@ def append_jsonl(path: str, record: dict) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "a") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def archive_journal(path: str) -> Optional[str]:
+    """開新帳戶時把舊日誌改名封存(檔名加上時間),讓 report 只看到目前帳戶。回傳封存後的路徑;沒有舊日誌回 None。"""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    base, ext = os.path.splitext(path)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(os.path.getmtime(path)))
+    dest = f"{base}.{stamp}{ext}"
+    n = 1
+    while os.path.exists(dest):  # 同一秒內多次封存
+        dest = f"{base}.{stamp}-{n}{ext}"
+        n += 1
+    os.replace(path, dest)
+    return dest

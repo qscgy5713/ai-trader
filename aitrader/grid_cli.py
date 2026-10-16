@@ -16,7 +16,7 @@ from .llm import (GRID_SCHEMA, CachedModel, GeminiModel, GridDecision, LLMConfig
 from .market import MIN_BARS, fetch_klines, fetch_price
 from .memory import format_reflection
 from .runtime import INTERVAL_SECS, StopFlag, handle_signals, wait
-from .state import acquire_lock, append_jsonl, load_json, save_json
+from .state import acquire_lock, archive_journal, append_jsonl, load_json, save_json
 
 FETCH_BARS = 120
 BAR_RETRIES = 3  # 模型暫時失敗時,同一根 K 線最多重試幾次
@@ -111,6 +111,9 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
         print(f"[grid] 接續 {path}:網格 {_fmt_grid(agent.grid_info(agent.engine.last_price, time.time()) if agent.engine else None)}")
     else:
         agent, last_bar = _new_agent(a, rc), 0
+        archived = archive_journal(journal)  # 新帳戶:舊日誌封存,report 只看目前帳戶
+        if archived:
+            print(f"[grid] 舊的決策日誌已封存為 {archived}")
         print(f"[grid] 新帳戶:{a.symbol} 模擬資金 {a.cash:g},模型 {getattr(model, 'name', a.model)}")
     if not a.no_learn and getattr(model, "can_reflect", False):
         n = len(agent.memory.lessons)
