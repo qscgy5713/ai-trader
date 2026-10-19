@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Optional
 
 SYSTEM = """You are a cautious crypto spot trading assistant operating a PAPER-TRADING account (long-only, no leverage, no shorting).
@@ -151,7 +152,7 @@ def futures_system(style: str = "auto") -> str:
 
 
 def build_futures_prompt(symbol: str, interval: str, feats: dict, position: dict, funding_rate: Optional[float],
-                         constraints: dict, memory: Optional[dict] = None) -> str:
+                         constraints: dict, memory: Optional[dict] = None, news: Optional[dict] = None) -> str:
     payload = {
         "symbol": symbol,
         "candle_interval": interval,
@@ -162,7 +163,56 @@ def build_futures_prompt(symbol: str, interval: str, feats: dict, position: dict
     }
     if memory is not None:
         payload["memory"] = memory
+    if news is not None:  # 放在資料裡說明用法,系統提示詞不變(沒開新聞時與先前逐字相同)
+        payload["market_news"] = dict(news, note=NEWS_NOTE)
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+NEWS_NOTE = ("Background from a once-a-day web news search. It may be incomplete, stale, or already priced in; treat it as "
+             "context alongside the price data, not as a trade signal by itself. `source_quality` counts how many cited "
+             "sites are well-known reputable outlets; give less weight when that number is low.")
+
+# 主流 / 一手來源網域(用來標示新聞來源品質;Google 搜尋無法限制網域,只能事後標示)
+REPUTABLE_NEWS_DOMAINS = frozenset({
+    "reuters.com", "bloomberg.com", "ft.com", "wsj.com", "cnbc.com", "apnews.com", "nytimes.com", "economist.com",
+    "marketwatch.com", "barrons.com", "morningstar.com",  # morningstar 轉載道瓊新聞
+    "coindesk.com", "theblock.co", "decrypt.co", "cointelegraph.com", "blockworks.co", "dlnews.com",
+    "sec.gov", "cftc.gov", "federalreserve.gov", "solana.com", "ethereum.org", "bitcoin.org",
+    "coinbase.com", "kraken.com",  # binance.com 不列入:含 Binance Square 等使用者發文,無法只憑網域區分官方公告
+})
+
+
+def is_reputable_source(site: str) -> bool:
+    """site:網域(例如 grounding 回傳的 title「coindesk.com」);子網域也算(www.reuters.com)。"""
+    d = site.strip().lower().split("/")[0]
+    return any(d == x or d.endswith("." + x) for x in REPUTABLE_NEWS_DOMAINS)
+
+
+# 每日新聞:要求只用可靠來源;Google 搜尋無法限制網域,所以另外記錄實際引用的網頁供人查核
+# (實測要求「site:網域」搜尋時,模型常改用自身知識回答、不附引用來源,所以不這樣要求)
+NEWS_SYSTEM = """You are a crypto market news researcher. Use Google Search to find SIGNIFICANT news from the past 24 hours
+about the given asset and the overall crypto market (e.g. BTC moves, ETF flows, regulation and enforcement, exchange or protocol
+incidents and hacks, token unlocks, major upgrades, and macro events such as Fed / interest-rate decisions or CPI).
+Source reliability rules:
+- Prefer reputable outlets and primary sources: Reuters, Bloomberg, Financial Times, WSJ, CNBC, CoinDesk, The Block, Decrypt,
+  Cointelegraph, and official announcements (the project or foundation, exchanges, SEC / CFTC, the Federal Reserve).
+- Do NOT use social media posts, rumors, anonymous claims, price predictions, sponsored / press-release content, or AI-generated
+  aggregator pages. If a claim is reported by only one low-quality site, leave it out.
+- Every event must name its source and the date stated by that source. Skip anything older than 3 days.
+- Report facts only; do not predict prices. If nothing notable is found, say so plainly and return an empty events list
+  with NEUTRAL sentiment.
+Write in Traditional Chinese. Respond with ONLY one JSON object, no other text:
+{"summary": "<= 250 chars", "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
+ "events": [{"date": "YYYY-MM-DD as stated by the source", "source": "publisher or official body", "event": "one sentence"}]}
+At most 4 events."""
+
+
+def build_news_prompt(symbol: str, ts: float) -> str:
+    asset = symbol[:-4] if symbol.endswith("USDT") else symbol
+    now = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))
+    return json.dumps({"asset": asset, "pair": symbol, "now": now,
+                       "task": f"Summarize significant news for {asset} and the crypto market in the 24 hours before {now}."},
+                      ensure_ascii=False, separators=(",", ":"))
 
 
 FUTURES_REFLECTION_SYSTEM = """You review yesterday's decisions of an AI-managed PERPETUAL FUTURES account (paper trading, long/short with leverage).

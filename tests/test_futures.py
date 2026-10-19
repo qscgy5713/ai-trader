@@ -727,3 +727,156 @@ class DowntimeTest(unittest.TestCase):
             self.assertEqual(out.getvalue().count("偵測到程式中斷"), 2)
             self.assertEqual(main(["report", j]), 0)
         self.assertIn("程式中斷 2 次", out.getvalue())
+
+
+class NewsModel(SeqModel):
+    """可搜尋新聞、可檢討的假模型。"""
+    can_reflect = can_search_news = True
+
+    def __init__(self, *decisions, news_errors=()):
+        super().__init__(*decisions)
+        self.news_calls, self.reflect_prompts, self.news_errors = [], [], list(news_errors)
+
+    def search_news(self, system, prompt):
+        from aitrader.llm import NewsBrief, NewsEvent
+        self.news_calls.append(prompt)
+        if self.news_errors:
+            raise self.news_errors.pop(0)
+        return NewsBrief("ETF 資金流入", "BULLISH", [NewsEvent("2023-11-14", "Reuters", "某事件")]), \
+            dict(META, sources=[{"title": "reuters.com", "uri": "https://x"}], search_queries=["sol news"])
+
+    def reflect(self, system, prompt):
+        from aitrader.llm import Reflection
+        self.reflect_prompts.append(prompt)
+        return Reflection("s", ["l"]), META
+
+
+class NewsTest(unittest.TestCase):
+    def test_reputable_source(self):
+        from aitrader.prompt import is_reputable_source
+        for ok in ("coindesk.com", "www.Reuters.com", "theblock.co"):
+            self.assertTrue(is_reputable_source(ok))
+        for bad in ("pluang.com", "notreuters.com", "coindesk.com.evil.io", ""):
+            self.assertFalse(is_reputable_source(bad))
+
+    def test_parse_news(self):
+        from aitrader.llm import parse_news
+        n = parse_news(json.dumps({"summary": " 無重大消息 ", "sentiment": "neutral", "events": [
+            {"date": "2026-10-19", "source": "CoinDesk", "event": "e"}, {"date": "", "source": "x", "event": "缺日期"}]}))
+        self.assertEqual((n.summary, n.sentiment, len(n.events)), ("無重大消息", "NEUTRAL", 1))  # 缺欄位的事件丟掉
+        fenced = parse_news('```json\n{"summary":"s","sentiment":"BULLISH","events":[]}\n```')
+        self.assertEqual(fenced.sentiment, "BULLISH")  # 容許 markdown 區塊
+        for bad in ('{"summary":"s","events":[]}', '{"summary":"s","sentiment":"MOON","events":[]}', "not json"):
+            with self.assertRaises(LLMError):
+                parse_news(bad)
+
+    def test_gemini_search_news_request(self):
+        from aitrader.llm import FUTURES_SCHEMA, GeminiModel
+        from tests.test_aitrader import _Resp, _ok
+        resp = _ok('{"summary":"s","sentiment":"BEARISH","events":[]}')
+        resp["candidates"][0]["groundingMetadata"] = {
+            "webSearchQueries": ["sol"], "groundingChunks": [{"web": {"title": "coindesk.com", "uri": "https://c"}}, {}]}
+        m = GeminiModel("K", "flash-x", reflect_model="pro-x", schema=FUTURES_SCHEMA, parser=parse_futures_decision)
+        with mock.patch("aitrader.llm.urllib.request.urlopen", return_value=_Resp(resp)) as u:
+            n, meta = m.search_news("SYS", "P")
+        req = u.call_args[0][0]
+        body = json.loads(req.data)
+        self.assertIn("models/pro-x:generateContent", req.full_url)  # 用檢討模型
+        self.assertEqual(body["tools"], [{"google_search": {}}])
+        self.assertNotIn("responseSchema", body["generationConfig"])  # 搭配結構化輸出常不附來源,改由文字取 JSON
+        self.assertEqual(n.sentiment, "BEARISH")
+        self.assertEqual(meta["sources"], [{"title": "coindesk.com", "uri": "https://c"}])
+        self.assertEqual(meta["search_queries"], ["sol"])
+        with mock.patch("aitrader.llm.urllib.request.urlopen", return_value=_Resp(_ok('{"action":"HOLD","leverage":0,"confidence":0.5,"reason":"r"}'))) as u:
+            m.decide("S", "P")
+        self.assertNotIn("tools", json.loads(u.call_args[0][0].data))  # 一般決策不搜尋
+
+    def test_news_off_by_default_and_once_per_day(self):
+        c = candles()
+        m = NewsModel()
+        a = FuturesAgent(acct(), FuturesRiskConfig())
+        a.decide(m, "SOLUSDT", "1h", c, 100, TS)
+        self.assertEqual(m.news_calls, [])  # 預設關閉(回放也是)
+        self.assertNotIn("market_news", m.calls[-1])
+        a.news_enabled = True
+        with tempfile.TemporaryDirectory() as t:
+            j = os.path.join(t, "j.jsonl")
+            rec = a.decide(m, "SOLUSDT", "1h", c, 100, TS + 3600, journal=j)
+            self.assertEqual(rec["news"]["sentiment"], "BULLISH")
+            self.assertIn('"asset":"SOL"', m.news_calls[0])
+            payload = json.loads(m.calls[-1])
+            self.assertEqual(payload["market_news"]["summary"], "ETF 資金流入")
+            self.assertIn("not as a trade signal", payload["market_news"]["note"])
+            self.assertNotIn("sources", payload["market_news"])  # 來源網址給人查核,不塞給 AI
+            self.assertEqual(payload["market_news"]["source_quality"], {"reputable_sites": 1, "total_sites": 1})
+            a.decide(m, "SOLUSDT", "1h", c, 100, TS + 3700, journal=j)  # TS 是 UTC 22:13,同一天內
+            self.assertEqual(len(m.news_calls), 1)  # 同一天只搜一次
+            kinds = [json.loads(l)["kind"] for l in open(j)]
+            self.assertEqual(kinds.count("futures_news"), 1)
+        a.decide(m, "SOLUSDT", "1h", c, 100, TS + 86400)  # 隔天:先檢討(附上昨天的消息面)再搜新的
+        self.assertEqual(len(m.news_calls), 2)
+        self.assertIn("ETF 資金流入", m.reflect_prompts[-1])
+        self.assertIsNone(a.news_view(TS + 86400 + 40 * 3600))  # 太舊就不附
+
+    def test_news_failures_do_not_stop_trading(self):
+        from aitrader.llm import LLMConfigError
+        c = candles()
+        m = NewsModel(D("LONG", 1), news_errors=[LLMError("timeout")] * 3)
+        a = FuturesAgent(acct(), FuturesRiskConfig())
+        a.news_enabled = True
+        rec = a.decide(m, "SOLUSDT", "1h", c, 100, TS)
+        self.assertIn("timeout", rec["news"]["error"])
+        self.assertIsNotNone(rec["trade"])  # 新聞失敗照常交易
+        for i in range(1, 4):
+            a.decide(m, "SOLUSDT", "1h", c, 100, TS + i * 60)
+        self.assertEqual(len(m.news_calls), 3)  # 當天最多 3 次
+        m3 = NewsModel()
+        m3.search_news = lambda system, prompt: (NewsModel().search_news(system, prompt)[0], dict(META, sources=[]))
+        c3 = FuturesAgent(acct(), FuturesRiskConfig())
+        c3.news_enabled = True
+        self.assertIn("沒有附上引用來源", c3.decide(m3, "SOLUSDT", "1h", c, 100, TS)["news"]["error"])
+        self.assertIsNone(c3.news)  # 無來源的結果不採用
+        self.assertEqual(c3.decide(m3, "SOLUSDT", "1h", c, 100, TS + 60)["news"]["meta"]["tokens_out"], 1)  # 仍記用量
+        m2 = NewsModel(news_errors=[LLMConfigError("400 不支援搜尋")])
+        b = FuturesAgent(acct(), FuturesRiskConfig())
+        b.news_enabled = True
+        b.decide(m2, "SOLUSDT", "1h", c, 100, TS)
+        b.decide(m2, "SOLUSDT", "1h", c, 100, TS + 60)
+        self.assertEqual(len(m2.news_calls), 1)  # 設定錯誤:當天不再重試,也不中斷
+
+    def test_news_persisted(self):
+        a = FuturesAgent(acct(), FuturesRiskConfig())
+        a.news_enabled = True
+        a.decide(NewsModel(), "SOLUSDT", "1h", candles(), 100, TS)
+        b = FuturesAgent.from_dict(json.loads(json.dumps(a.to_dict())), FuturesRiskConfig())
+        self.assertEqual(b.news, a.news)
+        self.assertFalse(b.news_enabled)  # 是否開啟以這次啟動參數為準
+        d = a.to_dict()
+        del d["news"], d["news_attempt_day"], d["news_attempts"]  # 舊版狀態檔
+        self.assertIsNone(FuturesAgent.from_dict(d, FuturesRiskConfig()).news)
+
+    def test_news_requires_gemini(self):
+        from aitrader.cli import main
+        with tempfile.TemporaryDirectory() as t, contextlib.redirect_stderr(io.StringIO()) as err, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["futures", "--model", "rule", "--news", "--state", os.path.join(t, "s.json")])
+        self.assertEqual(rc, 2)
+        self.assertIn("--news", err.getvalue())
+
+    def test_report_shows_news_and_tokens(self):
+        from aitrader.futures_cli import report_futures
+        m = NewsModel()
+        a = FuturesAgent(acct(), FuturesRiskConfig())
+        a.news_enabled = True
+        with tempfile.TemporaryDirectory() as t:
+            j = os.path.join(t, "j.jsonl")
+            a.decide(m, "SOLUSDT", "1h", candles(), 100, TS, journal=j)
+            recs = [json.loads(l) for l in open(j)]
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                report_futures(j, recs)
+        s = out.getvalue()
+        self.assertIn("每日新聞 1 次", s)
+        self.assertIn("消息面偏多", s)
+        self.assertIn("2023-11-14 Reuters:某事件", s)
+        self.assertIn("引用網站(主流來源 1/1):reuters.com ✓", s)
+        self.assertIn(";每日新聞 輸入 1 / 輸出 1", s)

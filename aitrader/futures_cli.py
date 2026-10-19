@@ -148,6 +148,8 @@ def cmd_futures(a) -> int:
         raise ValueError(f"--interval 只支援 {', '.join(INTERVAL_SECS)}")
     if a.check_every < 5:
         raise ValueError("--check-every 至少 5 秒")
+    if a.news and a.model != "gemini":
+        raise ValueError("--news 需要 --model gemini(要用 Google 搜尋)")
     model = _make_model(a.model, reflect_model=a.reflect_model)
     print(f"[futures] 模型 {model_label(model)}")
     path = a.state or os.path.join("state", _default_name(a, "futures") + ".json")
@@ -187,6 +189,11 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
     warn = _budget_warning(rc, agent.acct.wallet, money)
     if warn:
         print(f"[futures] {warn}")
+    agent.news_enabled = a.news
+    if a.news:
+        print("[futures] 每日新聞:每天(UTC)第一次決策時以 Google 搜尋可靠來源整理消息面,附給 AI 參考(使用每日檢討模型)")
+        if agent.news:
+            print(f"[futures] {_fmt_news(agent.news)}")
     if agent.acct.trade_count:
         try:
             p0 = fetch_premium(a.symbol)[0]
@@ -242,6 +249,8 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
                     rec = agent.decide(model, a.symbol, a.interval, candles, price, now, rate, journal)
                     if rec.get("reflection"):
                         print(f"[futures] {_hm(now)} " + format_reflection(rec["reflection"]), flush=True)
+                    if rec.get("news"):
+                        print(f"[futures] {_hm(now)} " + _fmt_news(rec["news"]), flush=True)
                     print(f"[futures] {_hm(now)} 標記價 {price}  " + _fmt_rec(rec) + f"\n    {_fmt_pos(agent, price, money)}"
                           f"\n    {_fmt_summary(agent, price, money)}", flush=True)
                     last_status = now
@@ -354,6 +363,7 @@ def report_futures(path: str, recs: List[dict], money: Money = Money()) -> int:
     decs = [r for r in recs if r.get("kind") == "futures"]
     fund = [r for r in recs if r.get("kind") == "futures_funding"]
     refl = [r for r in recs if r.get("kind") == "futures_reflection"]
+    news = [r for r in recs if r.get("kind") == "futures_news"]
     print(f"合約日誌 {path}:{len(recs)} 筆紀錄({_hm(recs[0]['ts'])} ~ {_hm(recs[-1]['ts'])})")
     decided = [r for r in decs if r.get("decision")]
     actions = Counter(r["decision"]["action"] for r in decided)
@@ -377,10 +387,13 @@ def report_futures(path: str, recs: List[dict], money: Money = Money()) -> int:
     if with_eq:
         last = with_eq[-1]
         print(f"最後權益 {money.fmt(last['equity_after'])}  曝險 {last.get('exposure_after', 0) / 100:+.2f} 倍")
-    tok_in = sum((r.get("meta") or {}).get("tokens_in", 0) for r in decs)
-    tok_out = sum((r.get("meta") or {}).get("tokens_out", 0) for r in decs)
-    if tok_in or tok_out:
-        print(f"tokens:輸入 {tok_in} / 輸出 {tok_out}")
+    def toks(rs: List[dict]) -> str:
+        return (f"輸入 {sum((r.get('meta') or {}).get('tokens_in', 0) for r in rs)} / "
+                f"輸出 {sum((r.get('meta') or {}).get('tokens_out', 0) for r in rs)}")
+    if any(r.get("meta") for r in decs + refl + news):
+        # 檢討與新聞可能用不同(較貴)的模型,分開列
+        print(f"tokens:決策 {toks(decs)}" + (f";每日檢討 {toks(refl)}" if refl else "")
+              + (f";每日新聞 {toks(news)}" if news else ""))
     if errors:
         print("最近的 AI 錯誤:")
         for r in errors[-3:]:
@@ -390,6 +403,11 @@ def report_futures(path: str, recs: List[dict], money: Money = Money()) -> int:
         print(f"每日檢討 {len(ok)} 次(失敗 {len(refl) - len(ok)} 次)")
         if ok:
             print("  " + format_reflection(ok[-1]).replace("\n", "\n  "))
+    if news:
+        ok = [r for r in news if not r.get("error")]
+        print(f"每日新聞 {len(ok)} 次(失敗 {len(news) - len(ok)} 次)")
+        if ok:
+            print("  " + _fmt_news(ok[-1]).replace("\n", "\n  "))
     if decided:
         print("最近 5 次決策:")
         for r in decided[-5:]:
@@ -442,6 +460,23 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="關閉學習(不附最近結果與心得、不做每日檢討);預設檔名加 _nolearn,可與學習版同時跑來比較")
 
 
+NEWS_SENTIMENT_NAMES = {"BULLISH": "偏多", "BEARISH": "偏空", "NEUTRAL": "中性"}
+
+
+def _fmt_news(n: dict) -> str:
+    """新聞摘要(日誌紀錄或 agent.news)給人看的文字;附上實際引用的網站供查核。"""
+    if n.get("error"):
+        return f"每日新聞({n['day']})搜尋失敗,稍後重試:{n['error']}"
+    lines = [f"每日新聞({n['day']},消息面{NEWS_SENTIMENT_NAMES.get(n['sentiment'], n['sentiment'])}):{n['summary']}"]
+    lines += [f"    - {e['date']} {e['source']}:{e['event']}" for e in n.get("events") or []]
+    sites = sorted({(s["title"], bool(s.get("reputable"))) for s in n.get("sources") or [] if s.get("title")},
+                   key=lambda x: (not x[1], x[0]))
+    good = sum(1 for _, r in sites if r)
+    lines.append(f"    引用網站(主流來源 {good}/{len(sites)}):"
+                 + ("、".join(t + (" ✓" if r else "") for t, r in sites) if sites else "(無)"))
+    return "\n".join(lines)
+
+
 def add_parsers(sub) -> None:
     p = sub.add_parser("futures", help="合約模擬盤:AI 決定做多 / 做空 / 空手與槓桿(不下真單)")
     _add_common(p)
@@ -453,6 +488,9 @@ def add_parsers(sub) -> None:
     p.add_argument("--reset", action="store_true", help="忽略既有狀態,重新開始(預設沿用 AI 的心得)")
     p.add_argument("--reset-memory", action="store_true", help="搭配 --reset:連 AI 的心得也一起清除")
     p.add_argument("--max-steps", type=int, default=0, help="問 AI 幾次後結束,0=持續執行")
+    p.add_argument("--news", action="store_true",
+                   help="每天(UTC)搜尋一次可靠來源的新聞,整理成消息面摘要附給 AI(用每日檢討模型 + Google 搜尋,另計費;"
+                        "回放無法取得當時新聞,不支援)")
     p.set_defaults(fn=cmd_futures)
 
     p = sub.add_parser("futures-replay", help="合約歷史回放(含歷史資金費、強平與停損)")

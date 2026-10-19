@@ -14,6 +14,7 @@ K 線收盤後問模型,決策再經信心門檻、槓桿上限、最小調整�
 from __future__ import annotations
 
 import bisect
+import time
 from dataclasses import asdict, dataclass
 from typing import List, Optional, Tuple
 
@@ -23,9 +24,12 @@ from .grid_agent import candle_path
 from .llm import FuturesDecision, LLMConfigError, LLMError
 from .market import MIN_BARS, Candle, features
 from .memory import LearningMemory, daily_reflection
-from .prompt import FUTURES_REFLECTION_SYSTEM, build_futures_prompt, futures_system
+from .prompt import (FUTURES_REFLECTION_SYSTEM, NEWS_SYSTEM, build_futures_prompt, build_news_prompt, futures_system,
+                     is_reputable_source)
 from .state import append_jsonl
 
+NEWS_MAX_ATTEMPTS = 3  # 每日新聞搜尋失敗最多重試幾次(之後當天放棄,不影響交易)
+NEWS_MAX_AGE_SECS = 36 * 3600  # 新聞摘要超過這個時間就不再附給 AI
 BANKRUPT_PCT = 1.0  # 權益低於初始資金此 % 視為爆倉,停止交易
 MIN_LEVERAGE = 0.1  # 額度限制後可開槓桿低於此值就不開倉
 
@@ -79,6 +83,10 @@ class FuturesAgent:
         self.learn = learn
         self.memory = LearningMemory(fill_label=None)
         self.day_start_costs = 0.0  # 當日開始時的累計手續費 + 資金費
+        # 每日新聞(只有模擬盤以 --news 開啟;回放看不到當時的新聞,一律關閉以免偷看未來)
+        self.news_enabled = False
+        self.news: Optional[dict] = None  # 最近一次成功的新聞摘要
+        self.news_attempt_day, self.news_attempts = "", 0
 
     # ---- 狀態 ----
     def _new_day(self, ts: float, price: float) -> None:
@@ -230,8 +238,12 @@ class FuturesAgent:
         eq0 = self.acct.equity(price)
         self.memory.settle(ts, price, eq0)
         rec = self._rec(price, ts, getattr(model, "name", "?"))
+        review = self.memory.review
+        if review and self.news and self.news["day"] == review["day_utc"] and "market_news" not in review:
+            review["market_news"] = {k: self.news[k] for k in ("summary", "sentiment", "events")}  # 檢討時一併參考當天消息面
         rec["reflection"] = (daily_reflection(self.memory, model, FUTURES_REFLECTION_SYSTEM, symbol, ts, journal,
                                               "futures_reflection") if self.learn else None)
+        rec["news"] = self.refresh_news(model, symbol, ts, journal) if self.news_enabled else None
         if self.halted_day != self.day and eq0 <= self.day_floor():
             # 空手時也要檢查(例如同一天連續停損):否則開倉後觸發價已在有利側,會立刻被平倉、白付手續費
             self.halted_day = self.day
@@ -242,7 +254,8 @@ class FuturesAgent:
         else:
             feats = features(candles)
             prompt = build_futures_prompt(symbol, interval, feats, self.position_info(price), funding_rate,
-                                          self._constraints(price), self.memory.prompt_view() if self.learn else None)
+                                          self._constraints(price), self.memory.prompt_view() if self.learn else None,
+                                          self.news_view(ts))
             decision = None
             try:
                 decision, meta = model.decide(self.system, prompt, feats)
@@ -267,6 +280,45 @@ class FuturesAgent:
                 {"position_after": side["side"] + (f" {side['leverage']:g}x" if side["side"] != "FLAT" else "")})
         rec.update(action_taken=why, code=code, trade=asdict(t) if t else None)
         return self._finish(rec, price, journal)
+
+    def refresh_news(self, model, symbol: str, ts: float, journal: Optional[str]) -> Optional[dict]:
+        """每天(UTC)第一次決策時搜尋一次新聞;回傳日誌紀錄(沒做則 None)。失敗不影響交易,當天最多重試 NEWS_MAX_ATTEMPTS 次。"""
+        if not getattr(model, "can_search_news", False) or (self.news and self.news["day"] == self.day):
+            return None
+        if self.news_attempt_day != self.day:
+            self.news_attempt_day, self.news_attempts = self.day, 0
+        if self.news_attempts >= NEWS_MAX_ATTEMPTS:
+            return None
+        rec = {"kind": "futures_news", "ts": ts, "day": self.day, "summary": None, "sentiment": None, "events": None,
+               "sources": None, "meta": None, "error": None}
+        try:
+            brief, meta = model.search_news(NEWS_SYSTEM, build_news_prompt(symbol, ts))
+            events = [asdict(e) for e in brief.events]
+            sources = meta.pop("sources", [])
+            rec["meta"] = meta  # 不採用時也記下用量(有花錢)
+            if not sources:  # 沒有可查核的引用來源:可能是模型憑記憶回答,不採用
+                raise LLMError("搜尋結果沒有附上引用來源,無法查核,不採用")
+            for s in sources:
+                s["reputable"] = is_reputable_source(s.get("title", ""))
+            self.news = {"day": self.day, "ts": ts, "summary": brief.summary, "sentiment": brief.sentiment,
+                         "events": events, "sources": sources}
+            rec.update(summary=brief.summary, sentiment=brief.sentiment, events=events, sources=sources)
+        except (LLMError, LLMConfigError) as e:  # 新聞只是輔助:連設定錯誤(例如模型不支援搜尋)也不停止交易
+            self.news_attempts = NEWS_MAX_ATTEMPTS if isinstance(e, LLMConfigError) else self.news_attempts + 1
+            rec["error"] = str(e)
+        if journal:
+            append_jsonl(journal, rec)
+        return rec
+
+    def news_view(self, ts: float) -> Optional[dict]:
+        """給 AI 看的新聞摘要;未開啟、沒有或太舊時回 None。"""
+        n = self.news
+        if not (self.news_enabled and n) or ts - n["ts"] > NEWS_MAX_AGE_SECS:
+            return None
+        src = n.get("sources") or []
+        return {"as_of_utc": time.strftime("%Y-%m-%d %H:%M", time.gmtime(n["ts"])), "summary": n["summary"],
+                "sentiment": n["sentiment"], "events": n["events"],
+                "source_quality": {"reputable_sites": sum(1 for s in src if s.get("reputable")), "total_sites": len(src)}}
 
     def _constraints(self, price: float) -> dict:
         c = self.cfg
@@ -330,7 +382,8 @@ class FuturesAgent:
         return {"acct": self.acct.to_dict(), "day": self.day, "day_start_equity": self.day_start_equity,
                 "trades_today": self.trades_today, "halted_day": self.halted_day, "pos_stop_pct": self.pos_stop_pct,
                 "trail_peak": self.trail_peak,
-                "day_start_costs": self.day_start_costs, "memory": self.memory.to_dict()}
+                "day_start_costs": self.day_start_costs, "memory": self.memory.to_dict(),
+                "news": self.news, "news_attempt_day": self.news_attempt_day, "news_attempts": self.news_attempts}
 
     @classmethod
     def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True, style: str = "auto") -> "FuturesAgent":
@@ -343,6 +396,8 @@ class FuturesAgent:
             a.trail_peak = None if d.get("trail_peak") is None else float(d["trail_peak"])
             a.day_start_costs = float(d.get("day_start_costs", a._costs()))
             a.memory = LearningMemory.from_dict(d.get("memory"), fill_label=None)
+            a.news = d.get("news") if isinstance(d.get("news"), dict) else None
+            a.news_attempt_day, a.news_attempts = str(d.get("news_attempt_day", "")), int(d.get("news_attempts", 0))
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(f"合約狀態檔格式錯誤:{e!r}") from e
         return a

@@ -79,6 +79,7 @@ class GeminiModel:
     """Gemini generateContent(JSON 結構化輸出)。金鑰放 header,不出現在網址或錯誤訊息。"""
 
     can_reflect = True  # 支援每日檢討(reflect)
+    can_search_news = True  # 支援以 Google 搜尋整理每日新聞(search_news)
 
     def __init__(self, api_key: str, model: str, timeout: float = 60.0, max_retries: int = 3,
                  temperature: float = 0.2, schema: Optional[dict] = None,
@@ -134,17 +135,24 @@ class GeminiModel:
         """每日檢討:回顧過去決策的結果,整理成心得。"""
         return self._generate(system, prompt, REFLECTION_SCHEMA, parse_reflection, self.reflect_model)
 
-    def _generate(self, system: str, prompt: str, schema: dict, parser: Callable[[str], object],
-                  model: str) -> Tuple[object, Dict]:
+    def search_news(self, system: str, prompt: str) -> Tuple["NewsBrief", Dict]:
+        """以 Google 搜尋整理新聞(用檢討模型,一天一次);meta["sources"] 是實際引用的網頁。
+        不指定 responseSchema:實測搭配結構化輸出時常不附引用來源,改由提示詞規定格式、從文字取出 JSON。"""
+        return self._generate(system, prompt, None, parse_news, self.reflect_model, tools=[{"google_search": {}}])
+
+    def _generate(self, system: str, prompt: str, schema: Optional[dict], parser: Callable[[str], object],
+                  model: str, tools: Optional[list] = None) -> Tuple[object, Dict]:
+        """schema=None:不要求結構化輸出(由 parser 自行從文字取出 JSON)。"""
+        config = {"temperature": self.temperature}
+        if schema is not None:
+            config.update(responseMimeType="application/json", responseSchema=schema)
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": self.temperature,
-                "responseMimeType": "application/json",
-                "responseSchema": schema,
-            },
+            "generationConfig": config,
         }
+        if tools:
+            body["tools"] = tools
         t0 = time.monotonic()
         resp = self._request(body, model)
         latency = time.monotonic() - t0
@@ -165,6 +173,11 @@ class GeminiModel:
             "tokens_in": usage.get("promptTokenCount", 0),
             "tokens_out": usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0),
         }
+        if tools:
+            g = cand.get("groundingMetadata") or {}
+            meta["search_queries"] = list(g.get("webSearchQueries") or [])[:5]
+            meta["sources"] = [{"title": str(w.get("title", ""))[:100], "uri": str(w.get("uri", ""))[:300]}
+                               for w in ((c.get("web") or {}) for c in g.get("groundingChunks") or []) if w][:8]
         return parser(text), meta
 
 
@@ -368,6 +381,50 @@ def parse_reflection(text: str) -> Reflection:
         raise LLMError("檢討輸出格式錯誤:需要 summary 字串與 lessons 陣列")
     lessons = [x.strip()[:200] for x in d["lessons"] if isinstance(x, str) and x.strip()]
     return Reflection(d["summary"].strip()[:500], lessons[:MAX_LESSONS])
+
+
+# ---------------- 每日新聞(Google 搜尋) ----------------
+
+NEWS_SENTIMENTS = ("BULLISH", "BEARISH", "NEUTRAL")
+MAX_NEWS_EVENTS = 4
+
+
+@dataclass
+class NewsEvent:
+    date: str  # 事件日期(YYYY-MM-DD,來源標示的日期)
+    source: str  # 來源名稱(例如 Reuters、CoinDesk、官方公告)
+    event: str  # 一句話說明
+
+
+@dataclass
+class NewsBrief:
+    summary: str  # 整體市場背景摘要
+    sentiment: str  # 消息面整體偏多 / 偏空 / 中性
+    events: List[NewsEvent]
+
+
+def _json_in_text(text: str) -> str:
+    """取出文字中的 JSON 物件(容許 ```json 區塊或前後說明文字)。"""
+    s = str(text or "")
+    i, j = s.find("{"), s.rfind("}")
+    return s[i:j + 1] if 0 <= i < j else s
+
+
+def parse_news(text: str) -> NewsBrief:
+    try:
+        d = json.loads(_json_in_text(text))
+    except (ValueError, TypeError) as e:
+        raise LLMError(f"模型輸出不是合法 JSON:{str(text)[:120]!r}") from e
+    if not isinstance(d, dict) or not isinstance(d.get("summary"), str) or not isinstance(d.get("events"), list):
+        raise LLMError("新聞輸出格式錯誤:需要 summary 字串與 events 陣列")
+    sentiment = str(d.get("sentiment", "")).upper()
+    if sentiment not in NEWS_SENTIMENTS:
+        raise LLMError(f"新聞 sentiment 不合法:{sentiment!r}")
+    events = []
+    for e in d["events"]:
+        if isinstance(e, dict) and all(isinstance(e.get(k), str) and e[k].strip() for k in ("date", "source", "event")):
+            events.append(NewsEvent(e["date"].strip()[:20], e["source"].strip()[:60], e["event"].strip()[:200]))
+    return NewsBrief(d["summary"].strip()[:500], sentiment, events[:MAX_NEWS_EVENTS])
 
 
 # ---------------- 合約模式:AI 決定多空方向與槓桿 ----------------
