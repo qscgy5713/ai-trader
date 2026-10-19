@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 try:
     import fcntl
@@ -75,15 +75,15 @@ def archive_journal(path: str) -> Optional[str]:
     return dest
 
 
-def old_lessons(path: str, a) -> list:
-    """開新帳戶時要沿用的心得:舊狀態檔裡的心得;--reset-memory 時不沿用。讀不到就回空清單。"""
+def old_lessons(path: str, a) -> Tuple[list, str]:
+    """開新帳戶時要沿用的心得與其檢討日期:舊狀態檔裡的心得;--reset-memory 時不沿用。讀不到就回 ([], "")。"""
     if getattr(a, "reset_memory", False) or not os.path.exists(path):
-        return []
+        return [], ""
     try:
         mem = (load_json(path).get("agent") or {}).get("memory") or {}
-        return [str(x) for x in mem.get("lessons") or []]
+        return [str(x) for x in mem.get("lessons") or []], str(mem.get("lessons_updated") or "")
     except (ValueError, OSError, AttributeError):
-        return []
+        return [], ""
 
 
 def try_lock(path: str):

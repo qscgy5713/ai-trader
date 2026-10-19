@@ -554,10 +554,10 @@ class KeepLessonsTest(unittest.TestCase):
                        "--max-steps", "1"] + extra)
         return rc, out.getvalue()
 
-    def _set_lessons(self, t, lessons):
+    def _set_lessons(self, t, lessons, day="2026-01-02"):
         p = os.path.join(t, "s.json")
         d = json.load(open(p))
-        d["agent"]["memory"]["lessons"] = lessons
+        d["agent"]["memory"]["lessons"], d["agent"]["memory"]["lessons_updated"] = lessons, day
         json.dump(d, open(p, "w"))
 
     def _lessons(self, t):
@@ -572,6 +572,7 @@ class KeepLessonsTest(unittest.TestCase):
             self.assertIn("沿用先前的 1 條心得", out)
             self.assertEqual(self._lessons(t), ["槓桿別太高"])
             d = json.load(open(os.path.join(t, "s.json")))
+            self.assertEqual(d["agent"]["memory"]["lessons_updated"], "2026-01-02")  # 檢討日期跟著沿用
             self.assertEqual(len(d["agent"]["memory"]["history"]), 0)  # 成績單重來(只有 pending)
             self.assertEqual(self._run(t, ["--reset-memory"])[0], 2)  # 需搭配 --reset
             self._run(t, ["--reset", "--reset-memory"])

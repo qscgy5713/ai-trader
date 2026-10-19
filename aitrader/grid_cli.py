@@ -113,11 +113,11 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
         saved_ts = d.get("saved_ts")
         print(f"[grid] 接續 {path}:網格 {_fmt_grid(agent.grid_info(agent.engine.last_price, time.time()) if agent.engine else None)}")
     else:
-        carried = old_lessons(path, a)  # 心得是對行情與策略的經驗,重開帳戶預設沿用
+        carried, carried_day = old_lessons(path, a)  # 心得是對行情與策略的經驗,重開帳戶預設沿用
         agent, last_bar = _new_agent(a, rc), 0
         saved_ts = None
         if carried:
-            agent.memory.lessons = carried
+            agent.memory.lessons, agent.memory.lessons_updated = carried, carried_day
             print(f"[grid] 沿用先前的 {len(carried)} 條心得(要連心得一起清除請加 --reset-memory)")
         archived = archive_journal(journal)  # 新帳戶:舊日誌封存,report 只看目前帳戶
         if archived:

@@ -171,11 +171,11 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
         last_bar, next_funding = d.get("last_bar_ts", 0), d.get("next_funding_ts", 0)
         print(f"[futures] 接續 {path}")
     else:
-        carried = old_lessons(path, a)  # 心得是對行情與策略的經驗,重開帳戶預設沿用
+        carried, carried_day = old_lessons(path, a)  # 心得是對行情與策略的經驗,重開帳戶預設沿用
         agent, last_bar, next_funding = _new_agent(a, rc, money), 0, 0
         saved_ts = None
         if carried:
-            agent.memory.lessons = carried
+            agent.memory.lessons, agent.memory.lessons_updated = carried, carried_day
             print(f"[futures] 沿用先前的 {len(carried)} 條心得(要連心得一起清除請加 --reset-memory)")
         archived = archive_journal(journal)  # 新帳戶:舊日誌封存,report 只看目前帳戶
         if archived:

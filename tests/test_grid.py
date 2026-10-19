@@ -460,10 +460,11 @@ class GridKeepLessonsTest(unittest.TestCase):
             args = ["grid", "--state", s, "--journal", os.path.join(t, "j.jsonl"), "--max-steps", "1"]
             main(args)
             d = json.load(open(s))
-            d["agent"]["memory"]["lessons"] = ["格數別太多"]
+            d["agent"]["memory"]["lessons"], d["agent"]["memory"]["lessons_updated"] = ["格數別太多"], "2026-01-02"
             json.dump(d, open(s, "w"))
             main(args + ["--reset"])
-            self.assertEqual(json.load(open(s))["agent"]["memory"]["lessons"], ["格數別太多"])
+            mem = json.load(open(s))["agent"]["memory"]
+            self.assertEqual((mem["lessons"], mem["lessons_updated"]), (["格數別太多"], "2026-01-02"))
             main(args + ["--reset", "--reset-memory"])
             self.assertEqual(json.load(open(s))["agent"]["memory"]["lessons"], [])
         self.assertIn("沿用先前的 1 條心得", out.getvalue())
