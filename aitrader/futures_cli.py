@@ -22,7 +22,7 @@ from .state import acquire_lock, append_jsonl, archive_journal, load_json, old_l
 FETCH_BARS = 120
 BAR_RETRIES = 3
 RETRY_DELAY = 60
-STYLE_MIN_CONFIDENCE = {"conservative": 0.6, "balanced": 0.5, "aggressive": 0.45}  # 未指定 --min-confidence 時依風格
+STYLE_MIN_CONFIDENCE = {"auto": 0.5, "conservative": 0.6, "balanced": 0.5, "aggressive": 0.45}  # 未指定 --min-confidence 時依風格
 WARN = "⚠ 合約有槓桿與強平風險;這是模擬盤,不下真單。模擬結果不代表實盤(實盤另有深度、插針、維持保證金級距等差異)"
 
 
@@ -70,7 +70,7 @@ def _budget_warning(rc: FuturesRiskConfig, equity: float, money: Money) -> str:
 
 def _risk_line(a, rc: FuturesRiskConfig, money: Money) -> str:
     amt = f"、或虧 {money.fmt(rc.daily_loss_amount)}" if rc.daily_loss_amount else ""
-    style = {"conservative": "保守", "balanced": "平衡偏積極", "aggressive": "積極"}[a.style]
+    style = {"auto": "不指定(AI 自行判斷)", "conservative": "保守", "balanced": "平衡偏積極", "aggressive": "積極"}[a.style]
     trail = (f";追蹤停損:獲利達 {rc.trail_activate_pct:g}% 啟動、回吐 {rc.trail_distance_pct:g}% 平倉"
              if rc.trail_activate_pct else ";追蹤停損關閉")
     return (f"風格 {style}(信心門檻 {rc.min_confidence:g});槓桿上限 {rc.max_leverage:g} 倍{trail};單日虧損上限 {rc.daily_loss_limit_pct:g}%{amt}(先到為準);"
@@ -406,9 +406,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--interval", default="1h", help="多久問一次 AI(K 線週期,預設 1h;支援 " + "/".join(INTERVAL_SECS) + ")")
     p.add_argument("--model", choices=["gemini", "rule"], default="gemini",
                    help="gemini=Gemini API;rule=離線規則基準(均線 + MACD 順勢),不花錢(預設 gemini)")
-    p.add_argument("--style", choices=["conservative", "balanced", "aggressive"], default="balanced",
-                   help="交易風格:conservative 保守(趨勢明確才進場)/ balanced 平衡偏積極 / aggressive 積極;"
-                        "只影響 AI 進場意願,風控不變(預設 balanced)")
+    p.add_argument("--style", choices=["auto", "conservative", "balanced", "aggressive"], default="auto",
+                   help="交易風格:auto 不指定、由 AI 自行判斷 / conservative 保守(趨勢明確才進場)/ balanced 平衡偏積極 /"
+                        " aggressive 積極;只影響 AI 進場意願,風控不變(預設 auto)")
     p.add_argument("--currency", choices=["USDT", "TWD"], default="USDT",
                    help="輸入與顯示的幣別;TWD 時 --cash、--daily-loss-amount 以台幣計(帳戶實際仍為 USDT,預設 USDT)")
     p.add_argument("--twd-rate", type=float, help="USDT/TWD 匯率;不指定則從 MAX 取即時匯率")

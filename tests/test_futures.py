@@ -403,7 +403,7 @@ class StyleTest(unittest.TestCase):
     def test_style_changes_system_prompt_only(self):
         from aitrader.prompt import futures_system
         seen = {}
-        for style in ("conservative", "balanced", "aggressive"):
+        for style in ("auto", "conservative", "balanced", "aggressive"):
             class M(SeqModel):
                 def decide(self, system, prompt, feats=None):
                     seen[style] = system
@@ -415,6 +415,14 @@ class StyleTest(unittest.TestCase):
         self.assertIn("slightly proactive", seen["balanced"])
         self.assertIn("AGGRESSIVE", seen["aggressive"])
         self.assertNotIn("{style}", seen["balanced"])
+        self.assertIn("none imposed", seen["auto"])  # auto:不指定風格,也不叫它 cautious
+        self.assertNotIn("cautious", seen["auto"])
+        self.assertIn("a cautious trader", seen["balanced"])
+        self.assertNotIn("{", seen["auto"] + seen["balanced"])  # 佔位符都有替換
+        for biased in ("default when signals are mixed", "Use lower leverage", "do not overreact"):
+            self.assertNotIn(biased, seen["auto"])  # auto 用中性說法
+            self.assertIn(biased, seen["balanced"])
+        self.assertEqual(futures_system(), seen["auto"])  # 預設 auto
         with self.assertRaises(ValueError):
             futures_system("yolo")
 

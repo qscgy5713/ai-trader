@@ -68,7 +68,7 @@ class FuturesRiskConfig:
 
 
 class FuturesAgent:
-    def __init__(self, acct: FuturesAccount, cfg: FuturesRiskConfig, learn: bool = True, style: str = "balanced"):
+    def __init__(self, acct: FuturesAccount, cfg: FuturesRiskConfig, learn: bool = True, style: str = "auto"):
         cfg.validate()
         self.acct, self.cfg = acct, cfg
         self.style, self.system = style, futures_system(style)  # 交易風格只影響提示詞,不影響風控
@@ -333,7 +333,7 @@ class FuturesAgent:
                 "day_start_costs": self.day_start_costs, "memory": self.memory.to_dict()}
 
     @classmethod
-    def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True, style: str = "balanced") -> "FuturesAgent":
+    def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True, style: str = "auto") -> "FuturesAgent":
         try:
             a = cls(FuturesAccount.from_dict(d["acct"]), cfg, learn, style)
             a.day, a.day_start_equity = str(d["day"]), float(d["day_start_equity"])

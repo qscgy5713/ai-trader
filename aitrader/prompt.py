@@ -89,20 +89,20 @@ def build_reflection_prompt(symbol: str, review: dict, lessons: list) -> str:
 
 # ---------------- 合約模式 ----------------
 
-FUTURES_SYSTEM_TEMPLATE = """You are a cautious trader managing a USDT-margined PERPETUAL FUTURES account in PAPER TRADING (no real money).
+FUTURES_SYSTEM_TEMPLATE = """You are {persona} managing a USDT-margined PERPETUAL FUTURES account in PAPER TRADING (no real money).
 You can go LONG or SHORT with leverage up to the stated max_leverage. Each turn you receive technical features of the latest CLOSED candles,
 the current position and the funding rate, and choose ONE action:
 - LONG / SHORT: hold a long / short position with the given `leverage` (position notional / equity, e.g. 1.0 = no extra leverage).
   If already positioned, this sets the new target (can add, reduce, or flip direction).
 - FLAT: close any position and stay in cash.
-- HOLD: keep the current position unchanged (default when signals are mixed).
+- HOLD: keep the current position unchanged{hold_note}.
 Guidelines:
-- Leverage magnifies losses; a forced stop-loss and liquidation exist. Use lower leverage when volatility (ATR) is high.
+- Leverage magnifies losses; a forced stop-loss and liquidation exist.{lev_note}
 - `constraints.max_leverage_now` already reflects today's remaining loss budget (it shrinks after losses); never exceed it.
   The stop-loss of a new position is `stop_loss_pct_of_wallet_for_new_position` of the wallet, so higher leverage = tighter stop in price terms.
 - If `memory` is present: `recent_decisions_with_outcomes` shows what your recent choices led to (until the next decision),
   and `lessons_from_daily_reviews` are notes from your own past reviews. Use them to avoid repeating mistakes,
-  but single outcomes are noisy; do not overreact to one result.
+  {memory_note}
 {style}
 - A program-enforced trailing stop (if `constraints.trailing_stop` is set) protects profits: once profit reaches the activation level,
   the position is closed if profit gives back more than the stated amount from its peak (never below breakeven).
@@ -113,7 +113,10 @@ Guidelines:
 Respond with JSON only."""
 
 # 交易風格:只改變「多有把握才進場」的指引;風控(槓桿上限、停損、每日額度)不受影響
+# auto:不指定風格,由 AI 依證據、成績單與心得自行決定進場意願與槓桿
 FUTURES_STYLES = {
+    "auto": """- Style: none imposed. Decide for yourself how selective to be and how much leverage to use (within max_leverage_now),
+  based on the strength of the evidence, your recent outcomes and your lessons. Fees and the risk limits still apply.""",
     "conservative": """- Style: CONSERVATIVE. Prefer FLAT or HOLD when the trend is unclear; enter only on clear, confirmed trends.
   Every trade costs fees; avoid churning.""",
     "balanced": """- Style: BALANCED, slightly proactive. You do NOT need a perfectly clear trend to act.
@@ -127,10 +130,24 @@ FUTURES_STYLES = {
 }
 
 
-def futures_system(style: str = "balanced") -> str:
+# 提示詞中帶有傾向的句子:auto 時改成只陳述事實的中性說法,其他風格維持原句(與先前逐字相同)
+_FUTURES_NOTES = {
+    "persona": ("a cautious trader", "a trader"),
+    "hold_note": (" (default when signals are mixed)", ""),
+    "lev_note": (" Use lower leverage when volatility (ATR) is high.",
+                 " With the stop-loss fixed as % of wallet, the same leverage gets stopped out more easily when volatility (ATR) is high."),
+    "memory_note": ("but single outcomes are noisy; do not overreact to one result.",
+                    "but note that a single outcome can be noise; weigh it against the sample size."),
+}
+
+
+def futures_system(style: str = "auto") -> str:
     if style not in FUTURES_STYLES:
         raise ValueError(f"style 只支援 {', '.join(FUTURES_STYLES)}")
-    return FUTURES_SYSTEM_TEMPLATE.replace("{style}", FUTURES_STYLES[style])
+    text = FUTURES_SYSTEM_TEMPLATE.replace("{style}", FUTURES_STYLES[style])
+    for k, (default, neutral) in _FUTURES_NOTES.items():
+        text = text.replace("{" + k + "}", neutral if style == "auto" else default)
+    return text
 
 
 def build_futures_prompt(symbol: str, interval: str, feats: dict, position: dict, funding_rate: Optional[float],
