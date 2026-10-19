@@ -27,3 +27,8 @@ def load_dotenv(path: str = ".env") -> None:
 def gemini_settings() -> Tuple[str, str]:
     """(API key, 模型名稱)。key 可能是空字串,由呼叫端決定是否需要。"""
     return os.environ.get("GEMINI_API_KEY", "").strip(), os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_MODEL
+
+
+def gemini_reflect_model() -> str:
+    """每日檢討用的模型(GEMINI_REFLECT_MODEL);空字串 = 與決策用同一個模型。"""
+    return os.environ.get("GEMINI_REFLECT_MODEL", "").strip()

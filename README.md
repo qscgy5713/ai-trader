@@ -30,6 +30,7 @@
    |---|---|---|
    | `GEMINI_API_KEY` | 必填 | Gemini API 金鑰 |
    | `GEMINI_MODEL` | `gemini-3.8-flash` | 模型名稱;想省錢可改 `gemini-3.5-flash-lite` |
+   | `GEMINI_REFLECT_MODEL` | (同 `GEMINI_MODEL`) | 網格 / 合約每日檢討用的模型。檢討一天只呼叫一次,可設成較強的 `gemini-3.1-pro-preview`,決策維持便宜的 Flash;也可用 `--reflect-model` 指定 |
 3. 跑測試:
    ```bash
    python3 -m unittest discover -s tests -t .

@@ -7,12 +7,12 @@ import sys
 import time
 from collections import Counter
 from dataclasses import asdict
-from typing import List
+from typing import List, Optional
 
-from .config import gemini_settings
+from .config import gemini_reflect_model, gemini_settings
 from .grid_agent import GridAgent, GridRiskConfig, grid_replay
 from .llm import (GRID_SCHEMA, CachedModel, GeminiModel, GridDecision, LLMConfigError, LLMError, RuleGridModel,
-                  parse_grid_decision)
+                  model_label, parse_grid_decision)
 from .market import MIN_BARS, fetch_klines, fetch_price
 from .memory import apply_pending_lessons, format_reflection
 from .runtime import INTERVAL_SECS, DowntimeWatch, StopFlag, fmt_hours, handle_signals, wait
@@ -24,11 +24,12 @@ SAVE_EVERY = 60  # 沒有成交時,至少每幾秒存一次檔
 RETRY_DELAY = 60  # 模型失敗後隔幾秒重試
 
 
-def _make_model(name: str, cache: bool = False, cache_dir: str = "cache"):
+def _make_model(name: str, cache: bool = False, cache_dir: str = "cache", reflect_model: Optional[str] = None):
     if name == "rule":
         return RuleGridModel()
     key, model = gemini_settings()
-    m = GeminiModel(key, model, schema=GRID_SCHEMA, parser=parse_grid_decision)
+    m = GeminiModel(key, model, schema=GRID_SCHEMA, parser=parse_grid_decision,
+                    reflect_model=reflect_model or gemini_reflect_model() or None)
     return CachedModel(m, cache_dir, GridDecision) if cache else m
 
 
@@ -91,7 +92,8 @@ def cmd_grid(a) -> int:
         raise ValueError(f"--interval 只支援 {', '.join(INTERVAL_SECS)}")
     if a.tick < 1:
         raise ValueError("--tick 至少 1 秒")
-    model = _make_model(a.model)
+    model = _make_model(a.model, reflect_model=a.reflect_model)
+    print(f"[grid] 模型 {model_label(model)}")
     path = a.state or os.path.join("state", _default_name(a, "grid") + ".json")
     journal = a.journal or os.path.join("journal", _default_name(a, "grid") + ".jsonl")
     lock = acquire_lock(path)
@@ -122,7 +124,7 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
         archived = archive_journal(journal)  # 新帳戶:舊日誌封存,report 只看目前帳戶
         if archived:
             print(f"[grid] 舊的決策日誌已封存為 {archived}")
-        print(f"[grid] 新帳戶:{a.symbol} 模擬資金 {a.cash:g},模型 {getattr(model, 'name', a.model)}")
+        print(f"[grid] 新帳戶:{a.symbol} 模擬資金 {a.cash:g}")
     if not a.no_learn and getattr(model, "can_reflect", False):
         n = len(agent.memory.lessons)
         print(f"[grid] 學習:每次決策附上最近的結果;每天(UTC 換日)檢討一次並更新心得(目前 {n} 條)")
@@ -223,10 +225,11 @@ def cmd_grid_replay(a) -> int:
         raise ValueError("--max-calls 不可為負")
     if a.limit < MIN_BARS + 2:
         raise ValueError(f"--limit 至少 {MIN_BARS + 2}")
-    model = _make_model(a.model, cache=a.model == "gemini", cache_dir=a.cache_dir)
+    model = _make_model(a.model, cache=a.model == "gemini", cache_dir=a.cache_dir, reflect_model=a.reflect_model)
     calls = (lambda: model.misses) if isinstance(model, CachedModel) else (lambda: 0)
     candles = fetch_klines(a.symbol, a.interval, a.limit)
     est = (len(candles) - MIN_BARS) // a.every + 1
+    print(f"模型 {model_label(model)}")
     print(f"{a.symbol} {a.interval} × {len(candles)} 根,每 {a.every} 根問一次 AI(約 {est} 次)"
           + (f",實際呼叫上限 {a.max_calls} 次(快取命中不計)" if a.model == "gemini" else ""))
     print("K 線內部走勢未知,以保守路徑(陽線先探低、陰線先拉高)撮合網格;實際成交次數會比回放多")
@@ -318,6 +321,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--interval", default="1h", help="多久問一次 AI(K 線週期,預設 1h;支援 " + "/".join(INTERVAL_SECS) + ")")
     p.add_argument("--model", choices=["gemini", "rule"], default="gemini",
                    help="gemini=Gemini API;rule=離線規則基準,不花錢(預設 gemini)")
+    p.add_argument("--reflect-model", help="每日檢討用的 Gemini 模型(例如 gemini-3.1-pro-preview);"
+                   "一天只呼叫一次,可用較強的模型而不多花太多錢。未指定時用 .env 的 GEMINI_REFLECT_MODEL,"
+                   "再沒有就與決策同一個模型")
     p.add_argument("--cash", type=float, default=10000, help="模擬資金(預設 10000)")
     p.add_argument("--fee", type=float, default=0.001, help="單邊手續費率(預設 0.001)")
     p.add_argument("--slippage-bps", type=float, default=5, help="市價單滑價,基點(預設 5;網格限價單不計)")

@@ -151,6 +151,36 @@ class GeminiTest(unittest.TestCase):
         self.assertEqual(d.action, "HOLD")  # 思考內容(thought)不會混進輸出
         self.assertEqual((meta["tokens_in"], meta["tokens_out"]), (100, 25))
 
+    def test_reflect_model_separate_from_decision_model(self):
+        from aitrader.llm import REFLECTION_SCHEMA, model_label
+        m = GeminiModel("K", "flash-x", reflect_model="pro-x")
+        refl = '{"summary":"s","lessons":["a"]}'
+        with mock.patch("aitrader.llm.urllib.request.urlopen", side_effect=[_Resp(_ok(GOOD)), _Resp(_ok(refl))]) as u:
+            _, m1 = m.decide("S", "P")
+            _, m2 = m.reflect("S", "P")
+        urls = [c[0][0].full_url for c in u.call_args_list]
+        self.assertIn("models/flash-x:generateContent", urls[0])  # 決策用 Flash
+        self.assertIn("models/pro-x:generateContent", urls[1])  # 每日檢討用 Pro
+        self.assertEqual(json.loads(u.call_args_list[1][0][0].data)["generationConfig"]["responseSchema"], REFLECTION_SCHEMA)
+        self.assertEqual((m1["model"], m2["model"]), ("gemini:flash-x", "gemini:pro-x"))
+        self.assertEqual(model_label(m), "gemini:flash-x(每日檢討 gemini:pro-x)")
+        self.assertEqual(model_label(GeminiModel("K", "flash-x")), "gemini:flash-x")  # 同一個模型不重複標示
+        self.assertEqual(model_label(RuleModel()), "rule")
+        with tempfile.TemporaryDirectory() as t:  # 快取:檢討模型不同時鍵不同;相同時與舊版一致
+            same, diff = CachedModel(GeminiModel("K", "flash-x"), t), CachedModel(m, t)
+            self.assertEqual(model_label(diff), "gemini:flash-x(每日檢討 gemini:pro-x)")
+            self.assertEqual(same._path("S", "P", same.inner.reflect_name), same._path("S", "P", "gemini:flash-x"))
+            self.assertNotEqual(same._path("S", "P", same.inner.reflect_name), diff._path("S", "P", diff.inner.reflect_name))
+
+    def test_reflect_model_setting_priority(self):
+        from aitrader.futures_cli import _make_model
+        env = {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "flash-x", "GEMINI_REFLECT_MODEL": "pro-env"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(_make_model("gemini").reflect_model, "pro-env")  # .env / 環境變數
+            self.assertEqual(_make_model("gemini", reflect_model="pro-cli").reflect_model, "pro-cli")  # 參數優先
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "flash-x"}, clear=True):
+            self.assertEqual(_make_model("gemini").reflect_model, "flash-x")  # 都沒設:與決策同一個
+
     def test_retry_on_429_then_success(self):
         seq = [_http_error(429, headers={"Retry-After": "2"}), _http_error(503), _Resp(_ok(GOOD))]
         with mock.patch("aitrader.llm.urllib.request.urlopen", side_effect=seq):

@@ -82,18 +82,21 @@ class GeminiModel:
 
     def __init__(self, api_key: str, model: str, timeout: float = 60.0, max_retries: int = 3,
                  temperature: float = 0.2, schema: Optional[dict] = None,
-                 parser: Optional[Callable[[str], object]] = None):
+                 parser: Optional[Callable[[str], object]] = None, reflect_model: Optional[str] = None):
         if not api_key:
             raise LLMConfigError("缺少 GEMINI_API_KEY:請在專案根目錄建立 .env(參考 .env.example)或設定環境變數")
         self.api_key, self.model = api_key, model
+        # 每日檢討一天只呼叫一次,可改用較強(較貴)的模型;None = 與決策同一個
+        self.reflect_model = reflect_model or model
+        self.reflect_name = f"gemini:{self.reflect_model}"
         # 預設輸出「目標持倉」決策;網格模式改用 GRID_SCHEMA / parse_grid_decision
         self.schema, self.parser = schema or DECISION_SCHEMA, parser or parse_decision
         self.name = f"gemini:{model}"
         self.timeout, self.max_retries, self.temperature = timeout, max_retries, temperature
 
-    def _request(self, body: dict) -> dict:
+    def _request(self, body: dict, model: str) -> dict:
         req = urllib.request.Request(
-            GEMINI_URL.format(model=self.model),
+            GEMINI_URL.format(model=model),
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
             method="POST",
@@ -114,7 +117,7 @@ class GeminiModel:
                 if e.code == 402:  # 額度 / 帳務問題:重試無用,必須由使用者處理
                     raise LLMConfigError(f"Gemini API 402 帳務問題:{detail}") from None
                 if e.code in (400, 401, 403, 404):
-                    raise LLMConfigError(f"Gemini API {e.code}:{detail}(請檢查金鑰、模型名稱 {self.model})") from None
+                    raise LLMConfigError(f"Gemini API {e.code}:{detail}(請檢查金鑰、模型名稱 {model})") from None
                 raise LLMError(f"Gemini API {e.code}:{detail}") from None
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 if attempt < self.max_retries:
@@ -125,13 +128,14 @@ class GeminiModel:
         raise LLMError("Gemini 重試次數用盡")  # pragma: no cover
 
     def decide(self, system: str, prompt: str, feats: Optional[dict] = None) -> Tuple[object, Dict]:
-        return self._generate(system, prompt, self.schema, self.parser)
+        return self._generate(system, prompt, self.schema, self.parser, self.model)
 
     def reflect(self, system: str, prompt: str) -> Tuple["Reflection", Dict]:
         """每日檢討:回顧過去決策的結果,整理成心得。"""
-        return self._generate(system, prompt, REFLECTION_SCHEMA, parse_reflection)
+        return self._generate(system, prompt, REFLECTION_SCHEMA, parse_reflection, self.reflect_model)
 
-    def _generate(self, system: str, prompt: str, schema: dict, parser: Callable[[str], object]) -> Tuple[object, Dict]:
+    def _generate(self, system: str, prompt: str, schema: dict, parser: Callable[[str], object],
+                  model: str) -> Tuple[object, Dict]:
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -142,7 +146,7 @@ class GeminiModel:
             },
         }
         t0 = time.monotonic()
-        resp = self._request(body)
+        resp = self._request(body, model)
         latency = time.monotonic() - t0
         cands = resp.get("candidates") or []
         if not cands:
@@ -156,7 +160,7 @@ class GeminiModel:
         text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
         usage = resp.get("usageMetadata") or {}
         meta = {
-            "model": self.name,
+            "model": f"gemini:{model}",
             "latency_s": round(latency, 2),
             "tokens_in": usage.get("promptTokenCount", 0),
             "tokens_out": usage.get("candidatesTokenCount", 0) + usage.get("thoughtsTokenCount", 0),
@@ -190,6 +194,13 @@ class RuleModel:
         return d, {"model": self.name, "latency_s": 0.0, "tokens_in": 0, "tokens_out": 0}
 
 
+def model_label(model) -> str:
+    """顯示用的模型名稱;每日檢討用不同模型時一併標示。"""
+    inner = getattr(model, "inner", model)
+    name, refl = getattr(model, "name", "?"), getattr(inner, "reflect_name", None)
+    return f"{name}(每日檢討 {refl})" if refl and refl != name else name
+
+
 class CachedModel:
     """以 (模型, system, prompt) 的雜湊快取決策到磁碟,重跑回放時不重複付費。
 
@@ -205,18 +216,21 @@ class CachedModel:
     def can_reflect(self) -> bool:
         return getattr(self.inner, "can_reflect", False)
 
-    def _path(self, system: str, prompt: str) -> str:
-        h = hashlib.sha256(f"{self.inner.name}\n{system}\n{prompt}".encode()).hexdigest()
+    def _path(self, system: str, prompt: str, name: str) -> str:
+        h = hashlib.sha256(f"{name}\n{system}\n{prompt}".encode()).hexdigest()
         return os.path.join(self.cache_dir, f"{h}.json")
 
     def decide(self, system: str, prompt: str, feats: Optional[dict] = None) -> Tuple[object, Dict]:
-        return self._cached(system, prompt, lambda: self.inner.decide(system, prompt, feats), self.decision_cls)
+        return self._cached(system, prompt, lambda: self.inner.decide(system, prompt, feats), self.decision_cls,
+                            self.inner.name)
 
     def reflect(self, system: str, prompt: str) -> Tuple["Reflection", Dict]:
-        return self._cached(system, prompt, lambda: self.inner.reflect(system, prompt), Reflection)
+        # 檢討模型不同時用它的名稱當快取鍵;相同時與舊快取一致
+        return self._cached(system, prompt, lambda: self.inner.reflect(system, prompt), Reflection,
+                            getattr(self.inner, "reflect_name", self.inner.name))
 
-    def _cached(self, system: str, prompt: str, call, cls) -> Tuple[object, Dict]:
-        path = self._path(system, prompt)
+    def _cached(self, system: str, prompt: str, call, cls, name: str) -> Tuple[object, Dict]:
+        path = self._path(system, prompt, name)
         if os.path.exists(path):
             try:
                 with open(path) as fh:

@@ -6,14 +6,14 @@ import os
 import sys
 import time
 from collections import Counter
-from typing import List
+from typing import List, Optional
 
-from .config import gemini_settings
+from .config import gemini_reflect_model, gemini_settings
 from .currency import Money, make_money
 from .futures import FuturesAccount
 from .futures_agent import FuturesAgent, FuturesRiskConfig, futures_replay
 from .llm import (FUTURES_SCHEMA, CachedModel, FuturesDecision, GeminiModel, LLMConfigError, LLMError,
-                  RuleFuturesModel, parse_futures_decision)
+                  RuleFuturesModel, model_label, parse_futures_decision)
 from .market import MIN_BARS, fetch_funding_history, fetch_klines, fetch_premium
 from .memory import apply_pending_lessons, format_reflection
 from .runtime import INTERVAL_SECS, DowntimeWatch, StopFlag, fmt_hours, handle_signals, parse_duration, wait
@@ -26,11 +26,12 @@ STYLE_MIN_CONFIDENCE = {"auto": 0.5, "conservative": 0.6, "balanced": 0.5, "aggr
 WARN = "⚠ 合約有槓桿與強平風險;這是模擬盤,不下真單。模擬結果不代表實盤(實盤另有深度、插針、維持保證金級距等差異)"
 
 
-def _make_model(name: str, cache: bool = False, cache_dir: str = "cache"):
+def _make_model(name: str, cache: bool = False, cache_dir: str = "cache", reflect_model: Optional[str] = None):
     if name == "rule":
         return RuleFuturesModel()
     key, model = gemini_settings()
-    m = GeminiModel(key, model, schema=FUTURES_SCHEMA, parser=parse_futures_decision)
+    m = GeminiModel(key, model, schema=FUTURES_SCHEMA, parser=parse_futures_decision,
+                    reflect_model=reflect_model or gemini_reflect_model() or None)
     return CachedModel(m, cache_dir, FuturesDecision) if cache else m
 
 
@@ -147,7 +148,8 @@ def cmd_futures(a) -> int:
         raise ValueError(f"--interval 只支援 {', '.join(INTERVAL_SECS)}")
     if a.check_every < 5:
         raise ValueError("--check-every 至少 5 秒")
-    model = _make_model(a.model)
+    model = _make_model(a.model, reflect_model=a.reflect_model)
+    print(f"[futures] 模型 {model_label(model)}")
     path = a.state or os.path.join("state", _default_name(a, "futures") + ".json")
     journal = a.journal or os.path.join("journal", _default_name(a, "futures") + ".jsonl")
     lock = acquire_lock(path)
@@ -180,8 +182,7 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
         archived = archive_journal(journal)  # 新帳戶:舊日誌封存,report 只看目前帳戶
         if archived:
             print(f"[futures] 舊的決策日誌已封存為 {archived}")
-        print(f"[futures] 新帳戶:{a.symbol} 模擬保證金 {money.fmt(agent.acct.initial)},"
-              f"模型 {getattr(model, 'name', a.model)}")
+        print(f"[futures] 新帳戶:{a.symbol} 模擬保證金 {money.fmt(agent.acct.initial)}")
     print(f"[futures] {_risk_line(a, rc, money)}")
     warn = _budget_warning(rc, agent.acct.wallet, money)
     if warn:
@@ -296,12 +297,13 @@ def cmd_futures_replay(a) -> int:
         raise ValueError("--max-calls 不可為負")
     if a.limit < MIN_BARS + 2:
         raise ValueError(f"--limit 至少 {MIN_BARS + 2}")
-    model = _make_model(a.model, cache=a.model == "gemini", cache_dir=a.cache_dir)
+    model = _make_model(a.model, cache=a.model == "gemini", cache_dir=a.cache_dir, reflect_model=a.reflect_model)
     calls = (lambda: model.misses) if isinstance(model, CachedModel) else (lambda: 0)
     candles = fetch_klines(a.symbol, a.interval, a.limit, futures=True)
     funding = fetch_funding_history(a.symbol, candles[0].ts, candles[-1].ts + 1)
     est = (len(candles) - MIN_BARS) // a.every + 1
     print(WARN)
+    print(f"模型 {model_label(model)}")
     print(f"{money.describe()}(回放全程用目前匯率換算);{_risk_line(a, rc, money)}")
     warn = _budget_warning(rc, money.to_usdt(a.cash), money)
     if warn:
@@ -406,6 +408,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--interval", default="1h", help="多久問一次 AI(K 線週期,預設 1h;支援 " + "/".join(INTERVAL_SECS) + ")")
     p.add_argument("--model", choices=["gemini", "rule"], default="gemini",
                    help="gemini=Gemini API;rule=離線規則基準(均線 + MACD 順勢),不花錢(預設 gemini)")
+    p.add_argument("--reflect-model", help="每日檢討用的 Gemini 模型(例如 gemini-3.1-pro-preview);"
+                   "一天只呼叫一次,可用較強的模型而不多花太多錢。未指定時用 .env 的 GEMINI_REFLECT_MODEL,"
+                   "再沒有就與決策同一個模型")
     p.add_argument("--style", choices=["auto", "conservative", "balanced", "aggressive"], default="auto",
                    help="交易風格:auto 不指定、由 AI 自行判斷 / conservative 保守(趨勢明確才進場)/ balanced 平衡偏積極 /"
                         " aggressive 積極;只影響 AI 進場意願,風控不變(預設 auto)")
