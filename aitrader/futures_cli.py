@@ -16,8 +16,8 @@ from .llm import (FUTURES_SCHEMA, CachedModel, FuturesDecision, GeminiModel, LLM
                   RuleFuturesModel, parse_futures_decision)
 from .market import MIN_BARS, fetch_funding_history, fetch_klines, fetch_premium
 from .memory import apply_pending_lessons, format_reflection
-from .runtime import INTERVAL_SECS, StopFlag, handle_signals, parse_duration, wait
-from .state import acquire_lock, archive_journal, old_lessons, load_json, save_json
+from .runtime import INTERVAL_SECS, DowntimeWatch, StopFlag, fmt_hours, handle_signals, parse_duration, wait
+from .state import acquire_lock, append_jsonl, archive_journal, load_json, old_lessons, save_json
 
 FETCH_BARS = 120
 BAR_RETRIES = 3
@@ -39,7 +39,8 @@ def _risk_cfg(a, money: Money) -> FuturesRiskConfig:
         raise ValueError("--daily-loss-amount 不可為負")
     min_conf = a.min_confidence if a.min_confidence is not None else STYLE_MIN_CONFIDENCE[a.style]
     c = FuturesRiskConfig(a.max_leverage, min_conf, a.min_change, a.stop_loss, a.daily_loss_limit,
-                          a.max_trades, money.to_usdt(a.daily_loss_amount), a.risk_per_trade, a.min_stop_distance)
+                          a.max_trades, money.to_usdt(a.daily_loss_amount), a.risk_per_trade, a.min_stop_distance,
+                          a.trail_activate, a.trail_distance)
     c.validate()
     return c
 
@@ -70,7 +71,9 @@ def _budget_warning(rc: FuturesRiskConfig, equity: float, money: Money) -> str:
 def _risk_line(a, rc: FuturesRiskConfig, money: Money) -> str:
     amt = f"、或虧 {money.fmt(rc.daily_loss_amount)}" if rc.daily_loss_amount else ""
     style = {"conservative": "保守", "balanced": "平衡偏積極", "aggressive": "積極"}[a.style]
-    return (f"風格 {style}(信心門檻 {rc.min_confidence:g});槓桿上限 {rc.max_leverage:g} 倍;單日虧損上限 {rc.daily_loss_limit_pct:g}%{amt}(先到為準);"
+    trail = (f";追蹤停損:獲利達 {rc.trail_activate_pct:g}% 啟動、回吐 {rc.trail_distance_pct:g}% 平倉"
+             if rc.trail_activate_pct else ";追蹤停損關閉")
+    return (f"風格 {style}(信心門檻 {rc.min_confidence:g});槓桿上限 {rc.max_leverage:g} 倍{trail};單日虧損上限 {rc.daily_loss_limit_pct:g}%{amt}(先到為準);"
             f"每筆最多用掉剩餘額度 {rc.risk_per_trade_pct:g}%")
 
 
@@ -86,6 +89,8 @@ def _fmt_pos(agent: FuturesAgent, price: float, money: Money) -> str:
     side = "多" if i["side"] == "LONG" else "空"
     liq = f"  強平價 {i['liquidation_price']:.2f}" if i.get("liquidation_price") else ""
     stop = f"  停損價 {i['stop_loss_price']:.2f}" if i.get("stop_loss_price") else ""
+    if i.get("trailing_stop_price"):
+        stop += f"  追蹤停損價 {i['trailing_stop_price']:.2f}"
     return (f"{side} {i['leverage']:.2f} 倍 @ {i['entry_price']:.2f}  未實現 {i['unrealized_pnl_pct_of_wallet']:+.2f}%"
             f"{stop}{liq}" + tail)
 
@@ -162,11 +167,13 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
         if d.get("symbol") != a.symbol or d.get("interval") != a.interval or d.get("model") != a.model:
             raise ValueError(f"狀態檔 {path} 的交易對 / 週期 / 模型與這次不同;加 --reset 重新開始或用 --state 指定其他檔案")
         agent = FuturesAgent.from_dict(d["agent"], rc, not a.no_learn, a.style)  # 風控、學習、風格以這次啟動為準
+        saved_ts = d.get("saved_ts")
         last_bar, next_funding = d.get("last_bar_ts", 0), d.get("next_funding_ts", 0)
         print(f"[futures] 接續 {path}")
     else:
         carried = old_lessons(path, a)  # 心得是對行情與策略的經驗,重開帳戶預設沿用
         agent, last_bar, next_funding = _new_agent(a, rc, money), 0, 0
+        saved_ts = None
         if carried:
             agent.memory.lessons = carried
             print(f"[futures] 沿用先前的 {len(carried)} 條心得(要連心得一起清除請加 --reset-memory)")
@@ -193,7 +200,7 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
 
     def save() -> None:
         save_json(path, {"symbol": a.symbol, "interval": a.interval, "model": a.model, "last_bar_ts": last_bar,
-                         "next_funding_ts": next_funding, "agent": agent.to_dict()})
+                         "next_funding_ts": next_funding, "saved_ts": time.time(), "agent": agent.to_dict()})
 
     save()
     secs = INTERVAL_SECS[a.interval]
@@ -201,10 +208,16 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
     retry_at = 0.0
     rate = None
     last_status = time.time()
+    watch = DowntimeWatch(saved_ts)  # 接續時:距上次存檔太久也算中斷
     try:
         while not stop.requested:
             now = time.time()
             try:
+                gap_s = watch.tick(now)
+                if gap_s:
+                    print(f"[futures] ⚠ 偵測到程式中斷 {fmt_hours(gap_s)}(電腦睡眠或程式未執行):這段期間沒有檢查停損、沒有問 AI。"
+                          "建議用 caffeinate -s 執行,避免睡眠", flush=True)
+                    append_jsonl(journal, {"kind": "futures_downtime", "ts": now, "from": now - gap_s, "seconds": round(gap_s)})
                 price, new_rate, nft = fetch_premium(a.symbol)
                 n = apply_pending_lessons(path, agent.memory)  # lessons --import 在執行中排入的心得
                 if n is not None:
@@ -255,6 +268,7 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
                 print(f"[futures] 本輪失敗,稍後重試:{e}", file=sys.stderr, flush=True)
             if a.max_steps and steps >= a.max_steps:
                 break
+            watch.mark(time.time())
             next_bar = (time.time() // secs + 1) * secs + 5
             gap = min(a.check_every, a.status_secs) if a.status_secs else a.check_every
             if not wait(min(gap, max(1.0, next_bar - time.time())), stop, time):
@@ -306,6 +320,7 @@ def cmd_futures_replay(a) -> int:
     print(f"期末權益 {money.fmt(r.equity)} / 本金 {money.fmt(agent.acct.initial)}  報酬 {r.return_pct:+.2f}%"
           f"  同期持有 {r.hold_return_pct:+.2f}%  最大回撤 {r.max_drawdown_pct:.2f}%")
     print(f"AI 決策 {r.decisions} 次(錯誤 {r.model_errors})  成交 {r.trades} 筆;停損 {r.stop_losses} 次、"
+          f"追蹤停損 {r.trailing_stops} 次、"
           f"單日上限 {r.daily_halts} 次、強平 {r.liquidations} 次")
     print(f"手續費 {money.fmt(r.fees_paid)}  資金費淨支付 {money.fmt(r.funding_paid, sign=True)}")
     if r.reflections:
@@ -323,7 +338,14 @@ def cmd_futures_replay(a) -> int:
 CODE_NAMES = {"execute": "執行", "hold": "維持", "noop": "已在目標", "low_confidence": "信心不足",
               "max_trades": "達每日交易上限", "halted": "停機中", "bankrupt": "爆倉", "no_decision": "無有效決策",
               "stop_loss": "停損", "daily_loss": "單日虧損上限", "liquidation": "強平",
-              "budget_exhausted": "今日額度不足"}
+              "budget_exhausted": "今日額度不足", "trailing_stop": "追蹤停損"}
+
+
+def _print_downtime(recs: List[dict], kind: str) -> None:
+    down = [r for r in recs if r.get("kind") == kind]
+    if down:
+        total = sum(r["seconds"] for r in down)
+        print(f"⚠ 程式中斷 {len(down)} 次,共 {fmt_hours(total)}(電腦睡眠或程式未執行):期間沒有檢查停損、沒有問 AI,成績可能失真")
 
 
 def report_futures(path: str, recs: List[dict], money: Money = Money()) -> int:
@@ -348,6 +370,7 @@ def report_futures(path: str, recs: List[dict], money: Money = Money()) -> int:
     paid = sum(r["paid"] for r in fund)
     print(f"成交 {len(trades)} 筆,已實現損益(未扣費){money.fmt(pnl, sign=True)},手續費 {money.fmt(fees)},"
           f"資金費淨支付 {money.fmt(paid, sign=True)}")
+    _print_downtime(recs, "futures_downtime")
     with_eq = [r for r in recs if "equity_after" in r and r.get("kind") == "futures"]
     if with_eq:
         last = with_eq[-1]
@@ -404,6 +427,10 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="單日最多虧損金額,以 --currency 計;與 --daily-loss-limit 先到為準,0=不用(預設 0)")
     g.add_argument("--risk-per-trade", type=float, default=50,
                    help="每筆倉位停損時最多用掉當日剩餘額度的 %%;今天虧越多倉位越小(預設 50)")
+    g.add_argument("--trail-activate", type=float, default=2,
+                   help="追蹤停損:持倉獲利達錢包此 %% 啟動,0=不啟用(預設 2)")
+    g.add_argument("--trail-distance", type=float, default=1.5,
+                   help="追蹤停損:從獲利高點回吐超過錢包此 %% 就平倉,最低約保本(未計手續費,預設 1.5)")
     g.add_argument("--min-stop-distance", type=float, default=0.5,
                    help="停損距離(價格 %%)下限,用來決定可開槓桿上限(預設 0.5)")
     p.add_argument("--no-learn", action="store_true",

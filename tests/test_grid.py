@@ -467,3 +467,31 @@ class GridKeepLessonsTest(unittest.TestCase):
             main(args + ["--reset", "--reset-memory"])
             self.assertEqual(json.load(open(s))["agent"]["memory"]["lessons"], [])
         self.assertIn("沿用先前的 1 條心得", out.getvalue())
+
+
+class GridDowntimeTest(unittest.TestCase):
+    def test_grid_sleep_detected(self):
+        from aitrader.cli import main
+        class SleepyTime(FakeTime):
+            n = 0
+
+            def sleep(self, sec):  # 第 3 次等待時睡了 1 小時
+                SleepyTime.n += 1
+                self.now += sec + (3600 if SleepyTime.n == 3 else 0)
+
+        ft = SleepyTime()
+
+        def price(symbol):
+            return 100.0
+
+        with tempfile.TemporaryDirectory() as t, \
+                mock.patch("aitrader.grid_cli.fetch_klines", return_value=candles()), \
+                mock.patch("aitrader.grid_cli.fetch_price", side_effect=price), \
+                mock.patch("aitrader.grid_cli.time", ft), \
+                mock.patch("aitrader.grid_cli._make_model", return_value=SeqModel(SET())), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            j = os.path.join(t, "j.jsonl")
+            main(["grid", "--state", os.path.join(t, "s.json"), "--journal", j, "--max-steps", "2"])
+            main(["report", j])
+        self.assertIn("偵測到程式中斷 1.0 小時", out.getvalue())
+        self.assertIn("程式中斷 1 次", out.getvalue())

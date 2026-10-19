@@ -629,3 +629,92 @@ class KeepLessonsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 apply_pending_lessons(s, m)
             self.assertFalse(os.path.exists(pending_lessons_path(s)))
+
+
+class TrailingStopTest(unittest.TestCase):
+    def agent(self, **kw):
+        return FuturesAgent(acct(), FuturesRiskConfig(**{"trail_activate_pct": 2, "trail_distance_pct": 1, **kw}))
+
+    def test_long_trailing_locks_profit(self):
+        a, cs = self.agent(), candles()
+        a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, TS)
+        self.assertIsNone(a.check(101.5, TS + 1))  # 獲利 1.5% < 2%:未啟動
+        self.assertIsNone(a.trail_peak)
+        self.assertIsNone(a.check(104, TS + 2))  # 獲利 4%:啟動,高點 4%
+        self.assertAlmostEqual(a.trail_peak, 4, places=6)
+        self.assertAlmostEqual(a.position_info(104)["trailing_stop_price"], 103, places=2)  # 回吐 1% → 3%
+        r = a.check(102.5, TS + 3, prev=103.5)  # 連續走勢穿越 103:以追蹤停損價出場
+        self.assertEqual(r["code"], "trailing_stop")
+        self.assertAlmostEqual(r["trade"]["price"], 103, places=6)
+        self.assertGreater(a.acct.wallet, 10000)
+        self.assertIsNone(a.trail_peak)
+        self.assertIn("追蹤停損", r["trade"]["reason"])
+
+    def test_short_trailing_never_below_breakeven_and_off_switch(self):
+        a, cs = self.agent(trail_activate_pct=2, trail_distance_pct=5), candles()
+        a.decide(SeqModel(D("SHORT", 1)), "X", "1h", cs, 100, TS)
+        a.check(97, TS + 1)  # 空單獲利 3%:啟動
+        self.assertAlmostEqual(a.position_info(97)["trailing_stop_price"], 100, places=6)  # 3% − 5% < 0 → 保本
+        r = a.check(100.5, TS + 2)
+        self.assertEqual(r["code"], "trailing_stop")
+        off = self.agent(trail_activate_pct=0)
+        off.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, TS)
+        off.check(110, TS + 1)
+        self.assertIsNone(off.trail_peak)
+
+    def test_new_trade_resets_trail_and_state_roundtrip(self):
+        a, cs = self.agent(), candles()
+        a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, TS)
+        a.check(104, TS + 1)
+        b = FuturesAgent.from_dict(json.loads(json.dumps(a.to_dict())), a.cfg)
+        self.assertAlmostEqual(b.trail_peak, a.trail_peak)
+        a.decide(SeqModel(D("SHORT", 1)), "X", "1h", cs, 104, TS + 2)  # 反手
+        self.assertIsNone(a.trail_peak)
+
+
+class DowntimeTest(unittest.TestCase):
+    def test_watch(self):
+        from aitrader.runtime import DowntimeWatch, fmt_hours
+        w = DowntimeWatch()
+        self.assertIsNone(w.tick(1000))
+        self.assertIsNone(w.tick(1030))
+        self.assertEqual(w.tick(1030 + 7200), 7200)
+        self.assertEqual(fmt_hours(7200), "2.0 小時")
+        self.assertEqual(fmt_hours(900), "15 分鐘")
+        self.assertEqual(DowntimeWatch(0.0 + 1).tick(1 + 3600), 3600)  # 接續:距上次存檔
+        w2 = DowntimeWatch(100)
+        self.assertIsNone(w2.tick(130))
+        w2.mark(130 + 900)  # 這一輪處理了 15 分鐘(例如 AI 逾時重試):不算中斷
+        self.assertIsNone(w2.tick(130 + 930))
+
+    def test_sleep_detected_in_loop_and_report(self):
+        from aitrader.cli import main
+        class SleepyTime(FakeTime):
+            """第 3 次等待時「睡著」3 小時(真實的睡眠發生在等待期間)。"""
+            n = 0
+
+            def sleep(self, sec):
+                SleepyTime.n += 1
+                self.now += sec + (3 * 3600 if SleepyTime.n == 3 else 0)
+
+        ft = SleepyTime()
+        ft.now = (ft.now // 3600) * 3600 + 60
+
+        def prem(symbol):
+            return 100.0, 0.0, ft.now + 10 ** 6
+
+        with tempfile.TemporaryDirectory() as t, \
+                mock.patch("aitrader.futures_cli.fetch_klines", return_value=candles()), \
+                mock.patch("aitrader.futures_cli.fetch_premium", side_effect=prem), \
+                mock.patch("aitrader.futures_cli.time", ft), \
+                mock.patch("aitrader.futures_cli._make_model", return_value=SeqModel(D("LONG", 1))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            j = os.path.join(t, "j.jsonl")
+            args = ["futures", "--state", os.path.join(t, "s.json"), "--journal", j, "--max-steps", "2"]
+            self.assertEqual(main(args), 0)
+            self.assertIn("偵測到程式中斷 3.0 小時", out.getvalue())
+            ft.now += 2 * 3600  # 程式停了 2 小時後再接續
+            self.assertEqual(main(args[:-1] + ["1"]), 0)
+            self.assertEqual(out.getvalue().count("偵測到程式中斷"), 2)
+            self.assertEqual(main(["report", j]), 0)
+        self.assertIn("程式中斷 2 次", out.getvalue())

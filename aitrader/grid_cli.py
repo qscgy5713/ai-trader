@@ -15,8 +15,8 @@ from .llm import (GRID_SCHEMA, CachedModel, GeminiModel, GridDecision, LLMConfig
                   parse_grid_decision)
 from .market import MIN_BARS, fetch_klines, fetch_price
 from .memory import apply_pending_lessons, format_reflection
-from .runtime import INTERVAL_SECS, StopFlag, handle_signals, wait
-from .state import acquire_lock, archive_journal, old_lessons, append_jsonl, load_json, save_json
+from .runtime import INTERVAL_SECS, DowntimeWatch, StopFlag, fmt_hours, handle_signals, wait
+from .state import acquire_lock, append_jsonl, archive_journal, load_json, old_lessons, save_json
 
 FETCH_BARS = 120
 BAR_RETRIES = 3  # 模型暫時失敗時,同一根 K 線最多重試幾次
@@ -110,10 +110,12 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
             raise ValueError(f"狀態檔 {path} 的交易對 / 週期 / 模型與這次不同;加 --reset 重新開始或用 --state 指定其他檔案")
         agent = GridAgent.from_dict(d["agent"], rc, not a.no_learn)  # 風控與學習開關以這次啟動為準,帳戶與網格沿用
         last_bar = d.get("last_bar_ts", 0)
+        saved_ts = d.get("saved_ts")
         print(f"[grid] 接續 {path}:網格 {_fmt_grid(agent.grid_info(agent.engine.last_price, time.time()) if agent.engine else None)}")
     else:
         carried = old_lessons(path, a)  # 心得是對行情與策略的經驗,重開帳戶預設沿用
         agent, last_bar = _new_agent(a, rc), 0
+        saved_ts = None
         if carried:
             agent.memory.lessons = carried
             print(f"[grid] 沿用先前的 {len(carried)} 條心得(要連心得一起清除請加 --reset-memory)")
@@ -129,7 +131,7 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
 
     def save() -> None:
         save_json(path, {"symbol": a.symbol, "interval": a.interval, "model": a.model, "last_bar_ts": last_bar,
-                         "agent": agent.to_dict()})
+                         "saved_ts": time.time(), "agent": agent.to_dict()})
 
     save()
     secs = INTERVAL_SECS[a.interval]
@@ -140,10 +142,16 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
     retry_at = 0.0  # 模型失敗後,下一次重試的時刻(網格照常每 tick 撮合)
     last_tick = None if agent.engine is None else 0.0  # 接續既有網格:第一個 tick 視為跳空
     last_save = time.time()
+    watch = DowntimeWatch(saved_ts)  # 接續時:距上次存檔太久也算中斷
     try:
         while not stop.requested:
             now = time.time()
             try:
+                gap_s = watch.tick(now)
+                if gap_s:
+                    print(f"[grid] ⚠ 偵測到程式中斷 {fmt_hours(gap_s)}(電腦睡眠或程式未執行):這段期間沒有撮合網格、沒有問 AI。"
+                          "建議用 caffeinate -s 執行,避免睡眠", flush=True)
+                    append_jsonl(journal, {"kind": "grid_downtime", "ts": now, "from": now - gap_s, "seconds": round(gap_s)})
                 price = fetch_price(a.symbol)
                 n = apply_pending_lessons(path, agent.memory)  # lessons --import 在執行中排入的心得
                 if n is not None:
@@ -188,6 +196,7 @@ def _grid_loop(a, rc: GridRiskConfig, model, path: str, journal: str, stop: Stop
                 print(f"[grid] 本輪失敗,稍後重試:{e}", file=sys.stderr, flush=True)
             if a.max_steps and steps >= a.max_steps:
                 break
+            watch.mark(time.time())
             if not wait(a.tick, stop, time):
                 break
     except KeyboardInterrupt:
@@ -269,6 +278,10 @@ def report_grid(path: str, recs: List[dict]) -> int:
     if events:
         print("強制出場:" + "、".join(f"{ {'stop_loss': '停損', 'daily_loss': '單日虧損上限'}.get(k, k)} {v} 次"
                                    for k, v in events.items()))
+    down = [r for r in recs if r.get("kind") == "grid_downtime"]
+    if down:
+        print(f"⚠ 程式中斷 {len(down)} 次,共 {fmt_hours(sum(r['seconds'] for r in down))}(電腦睡眠或程式未執行):"
+              "期間沒有撮合網格、沒有問 AI,成績可能失真")
     with_eq = [r for r in recs if "equity_after" in r]  # 檢討紀錄沒有權益
     if with_eq:
         print(f"最後權益 {with_eq[-1]['equity_after']:.2f}")

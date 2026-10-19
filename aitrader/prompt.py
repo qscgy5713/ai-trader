@@ -104,6 +104,9 @@ Guidelines:
   and `lessons_from_daily_reviews` are notes from your own past reviews. Use them to avoid repeating mistakes,
   but single outcomes are noisy; do not overreact to one result.
 {style}
+- A program-enforced trailing stop (if `constraints.trailing_stop` is set) protects profits: once profit reaches the activation level,
+  the position is closed if profit gives back more than the stated amount from its peak (never below breakeven).
+  `position.trailing_stop_price` shows the current level when active.
 - Funding: when funding_rate_per_8h is positive, longs pay shorts every 8 hours (and vice versa). It matters for long holding periods.
 - confidence reflects strength of evidence (0-1). Base the decision ONLY on the provided data. For FLAT / HOLD set leverage to 0.
 - Write `reason` in Traditional Chinese, concise (<= 200 characters).

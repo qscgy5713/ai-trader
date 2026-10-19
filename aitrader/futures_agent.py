@@ -41,6 +41,8 @@ class FuturesRiskConfig:
     daily_loss_amount: float = 0.0  # 單日最多虧損金額(USDT);0 = 只用 %。與 % 先到者為準
     risk_per_trade_pct: float = 50.0  # 每筆倉位停損時最多用掉當日剩餘額度的 %
     min_stop_distance_pct: float = 0.5  # 停損距離(價格 %)下限
+    trail_activate_pct: float = 2.0  # 持倉獲利達錢包此 % 啟動追蹤停損;0 = 不啟用
+    trail_distance_pct: float = 1.5  # 從獲利高點回吐超過錢包此 % 就平倉(最低約保本,未計手續費)
 
     def validate(self) -> None:
         if not 0 < self.max_leverage <= 10:
@@ -61,6 +63,8 @@ class FuturesRiskConfig:
             raise ValueError("risk_per_trade 需在 (0, 100]")
         if not 0 < self.min_stop_distance_pct < 50:
             raise ValueError("min_stop_distance 需在 (0, 50)")
+        if self.trail_activate_pct < 0 or not 0 < self.trail_distance_pct < 100:
+            raise ValueError("trail_activate 不可為負;trail_distance 需在 (0, 100)")
 
 
 class FuturesAgent:
@@ -71,6 +75,7 @@ class FuturesAgent:
         self.day, self.day_start_equity, self.trades_today = "", acct.wallet, 0
         self.halted_day = ""
         self.pos_stop_pct = cfg.stop_loss_pct  # 目前倉位的停損(錢包 %),開倉時依剩餘額度決定
+        self.trail_peak: Optional[float] = None  # 追蹤停損啟動後的最高獲利(錢包 %);None = 未啟動
         self.learn = learn
         self.memory = LearningMemory(fill_label=None)
         self.day_start_costs = 0.0  # 當日開始時的累計手續費 + 資金費
@@ -118,11 +123,34 @@ class FuturesAgent:
                 "equity": round(a.equity(price), 2)}
         if side != "FLAT":
             liq, stop = a.liq_price(), a.stop_price(self.pos_stop_pct)
+            trail = self._trail_price()
             info.update(entry_price=round(a.entry, 6),
                         unrealized_pnl_pct_of_wallet=round(-a.position_loss_pct(price), 2),
                         liquidation_price=round(liq, 2) if liq else None,
-                        stop_loss_price=round(stop, 2) if stop else None)
+                        stop_loss_price=round(stop, 2) if stop else None,
+                        trailing_stop_price=round(trail, 2) if trail else None)
         return info
+
+    def _update_trail(self, price: float) -> None:
+        """依目前價格更新追蹤停損的獲利高點(獲利達門檻才啟動)。"""
+        c, a = self.cfg, self.acct
+        if not c.trail_activate_pct or abs(a.qty) < DUST:
+            return
+        profit = -a.position_loss_pct(price)  # 獲利占錢包 %
+        if self.trail_peak is None:
+            if profit >= c.trail_activate_pct:
+                self.trail_peak = profit
+        else:
+            self.trail_peak = max(self.trail_peak, profit)
+
+    def _trail_price(self) -> Optional[float]:
+        """追蹤停損價:獲利回落到 max(高點 − 回吐距離, 0) 的價格。"""
+        a = self.acct
+        if self.trail_peak is None or abs(a.qty) < DUST or a.wallet <= 0:
+            return None
+        floor = max(self.trail_peak - self.cfg.trail_distance_pct, 0.0)
+        p = a.entry + floor / 100 * a.wallet / a.qty
+        return p if p > 0 else None
 
     def _triggers(self) -> List[Tuple[float, str]]:
         a, c = self.acct, self.cfg
@@ -135,6 +163,9 @@ class FuturesAgent:
         stop = a.stop_price(self.pos_stop_pct)
         if stop:
             out.append((stop, "stop_loss"))
+        trail = self._trail_price()
+        if trail:
+            out.append((trail, "trailing_stop"))
         if self.halted_day != self.day and self.day_start_equity > 0:
             # equity == 當日權益下限 的價格
             p = a.entry + (self.day_floor() - a.wallet) / a.qty
@@ -151,6 +182,7 @@ class FuturesAgent:
         if abs(a.qty) < DUST:
             return None
         long = a.qty > 0
+        self._update_trail(price)
         hit = [(p, code) for p, code in self._triggers() if (price <= p if long else price >= p)]
         if not hit:
             return None
@@ -169,10 +201,14 @@ class FuturesAgent:
             px = p if continuous else price
             if code == "stop_loss":
                 why = f"持倉虧損達錢包 {self.pos_stop_pct:.2f}%,停損平倉"
+            elif code == "trailing_stop":
+                why = (f"追蹤停損:獲利從高點 {self.trail_peak:.2f}% 回吐超過 {self.cfg.trail_distance_pct:g}%,"
+                       "平倉保住獲利")
             else:
                 why = "權益觸及今日虧損上限,平倉並停止交易至明天(UTC)"
                 self.halted_day = self.day
             t = a.rebalance(0, px, ts, why)  # 原因寫中文,畫面「最近成交」直接顯示
+        self.trail_peak = None
         self.memory.on_tick(0, code)
         rec.update(forced=True, action_taken=why, code=code, trade=asdict(t) if t else None)
         return self._finish(rec, price, journal)
@@ -220,6 +256,7 @@ class FuturesAgent:
         t = self.acct.rebalance(target, price, ts, why) if target is not None else None
         if t:
             self.trades_today += 1
+            self.trail_peak = None  # 倉位變了:追蹤停損重新計算
             if target:
                 self.pos_stop_pct = stop_pct  # 新倉位的停損依開倉當下的剩餘額度
         if rec["decision"] is not None:  # 模型失敗(稍後重試)不記,避免成績單被錯誤紀錄擠掉
@@ -237,6 +274,8 @@ class FuturesAgent:
         return {"max_leverage_now": round(cap, 2), "max_leverage_config": c.max_leverage,
                 "taker_fee_rate": self.acct.fee_rate,
                 "stop_loss_pct_of_wallet_for_new_position": round(stop_pct, 3),
+                "trailing_stop": ({"activate_at_profit_pct_of_wallet": c.trail_activate_pct,
+                                   "giveback_pct_of_wallet": c.trail_distance_pct} if c.trail_activate_pct else None),
                 "daily_loss_budget_left_pct_of_equity": round(self.budget_left(price) / self.acct.equity(price) * 100, 2)
                 if self.acct.equity(price) > 0 else 0.0,
                 "trades_left_today": max(0, c.max_trades_per_day - self.trades_today)}
@@ -290,6 +329,7 @@ class FuturesAgent:
     def to_dict(self) -> dict:
         return {"acct": self.acct.to_dict(), "day": self.day, "day_start_equity": self.day_start_equity,
                 "trades_today": self.trades_today, "halted_day": self.halted_day, "pos_stop_pct": self.pos_stop_pct,
+                "trail_peak": self.trail_peak,
                 "day_start_costs": self.day_start_costs, "memory": self.memory.to_dict()}
 
     @classmethod
@@ -300,6 +340,7 @@ class FuturesAgent:
             a.trades_today, a.halted_day = int(d["trades_today"]), str(d["halted_day"])
             # 舊版狀態檔沒有以下欄位
             a.pos_stop_pct = float(d.get("pos_stop_pct", cfg.stop_loss_pct))
+            a.trail_peak = None if d.get("trail_peak") is None else float(d["trail_peak"])
             a.day_start_costs = float(d.get("day_start_costs", a._costs()))
             a.memory = LearningMemory.from_dict(d.get("memory"), fill_label=None)
         except (KeyError, TypeError, ValueError) as e:
@@ -322,6 +363,7 @@ class FuturesReplayResult:
     model_errors: int
     trades: int
     stop_losses: int
+    trailing_stops: int
     liquidations: int
     daily_halts: int
     funding_paid: float
@@ -342,8 +384,8 @@ def futures_replay(model, symbol: str, interval: str, candles: List[Candle], age
     a = agent.acct
     start_price = end_price = candles[start + 1].open
     peak, max_dd = a.equity(start_price), 0.0
-    counts = {"decisions": 0, "errors": 0, "trades": 0, "stop_loss": 0, "liquidation": 0, "daily_loss": 0,
-              "reflections": 0}
+    counts = {"decisions": 0, "errors": 0, "trades": 0, "stop_loss": 0, "trailing_stop": 0, "liquidation": 0,
+              "daily_loss": 0, "reflections": 0}
     stopped = False
     prev_close = candles[start].close
     times = [t for t, _ in funding]
@@ -388,5 +430,6 @@ def futures_replay(model, symbol: str, interval: str, candles: List[Candle], age
     eq = a.equity(end_price)
     return FuturesReplayResult(processed, start_price, end_price, eq, (eq / a.initial - 1) * 100,
                                (end_price / start_price - 1) * 100, max_dd * 100, counts["decisions"],
-                               counts["errors"], counts["trades"], counts["stop_loss"], counts["liquidation"],
+                               counts["errors"], counts["trades"], counts["stop_loss"], counts["trailing_stop"],
+                               counts["liquidation"],
                                counts["daily_loss"], a.funding_paid, a.fees_paid, counts["reflections"], stopped)
