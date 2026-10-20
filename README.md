@@ -190,6 +190,15 @@ USDT 永續合約、單向持倉、全倉保證金。**只模擬,不下真單**;
   接續時先列出累計成績與最近 5 筆成交,不必另外執行 `report`。
 - 兩次決策之間每 `--status-every`(預設 `5m`,可寫 `5s` / `5m` / `1h` 或秒數,`0` 關閉,最短 5 秒)印一行狀態:
   標記價、持倉、未實現損益、權益、今日剩餘額度、下次問 AI 的時間。只顯示,不交易、不增加 AI 費用。
+- **多個交易對**:`--symbol SOLUSDT,ETHUSDT,SUIUSDT`(逗號分隔,最多 8 個)。
+  - `futures`:每個交易對一個子程式同時執行,帳戶、心得、新聞、狀態檔與日誌各自獨立(檔名依交易對),
+    輸出每行加上 `[SOL]` 等前綴;Ctrl+C 或關閉視窗時全部存檔後結束。費用約為單一交易對 × 個數。
+    已在跑的交易對(例如 SOL)不要重複放進另一個指令,會因狀態檔已被鎖住而只有那一個失敗。
+  - `futures-replay`:依序回放,最後列出各交易對的報酬 / 回撤 / 成交對照表;單一交易對失敗不影響其他。
+  - 多個交易對時不能指定 `--state` / `--journal`。
+  - 只重設其中幾個:`--reset ETHUSDT`(逗號分隔,其他照常接續);`--reset` 不加值則全部重設。
+    例如舊狀態檔的週期與這次不同而拒絕接續時,加一次 `--reset ETHUSDT` 啟動,之後同一個指令拿掉 `--reset` 即可。
+  - 某個交易對啟動失敗或中途結束時,會立刻顯示「[ETH] 已結束(代碼 2);⚠ 其他交易對繼續執行」。
 
 ### 依當日剩餘額度控管倉位
 
@@ -298,9 +307,10 @@ aitrader/
   futures_cli.py futures / futures-replay 指令與合約報表
   currency.py   USDT / 台幣換算與顯示
   runtime.py    安全停止(訊號)與可中斷等待
+  multi.py      多交易對:每個交易對一個子程式、輸出加前綴
   state.py      狀態原子寫入、檔案鎖、決策日誌
   cli.py        命令列入口(python3 -m aitrader)
-tests/          單元測試(Gemini 以模擬 HTTP 回應測試,不需金鑰;test_grid.py 網格、test_futures.py 合約)
+tests/          單元測試(Gemini 以模擬 HTTP 回應測試,不需金鑰;test_grid.py 網格、test_futures.py 合約、test_multi.py 多交易對)
 state/ journal/ cache/   執行時產生(已 gitignore)
 doc/            過程文件
 ```

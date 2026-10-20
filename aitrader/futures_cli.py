@@ -16,6 +16,7 @@ from .llm import (FUTURES_SCHEMA, CachedModel, FuturesDecision, GeminiModel, LLM
                   RuleFuturesModel, model_label, parse_futures_decision)
 from .market import MIN_BARS, fetch_funding_history, fetch_klines, fetch_premium
 from .memory import apply_pending_lessons, format_reflection
+from .multi import drop_option, parse_symbols, replace_symbol, run_multi
 from .runtime import INTERVAL_SECS, DowntimeWatch, StopFlag, fmt_hours, handle_signals, parse_duration, wait
 from .state import acquire_lock, append_jsonl, archive_journal, load_json, old_lessons, save_json
 
@@ -137,7 +138,7 @@ def _fmt_rec(rec: dict) -> str:
 # ------------------------------ futures(模擬盤) ------------------------------
 
 def cmd_futures(a) -> int:
-    if a.reset_memory and not a.reset:
+    if a.reset_memory and a.reset is None:
         raise ValueError("--reset-memory 需搭配 --reset 使用")
     a.status_secs = parse_duration(a.status_every)
     if 0 < a.status_secs < 5:
@@ -150,6 +151,12 @@ def cmd_futures(a) -> int:
         raise ValueError("--check-every 至少 5 秒")
     if a.news and a.model != "gemini":
         raise ValueError("--news 需要 --model gemini(要用 Google 搜尋)")
+    symbols = _symbols(a)
+    _resolve_reset(a, symbols)  # 多個交易對時由 _child_argv 只把 --reset 傳給要重設的交易對
+    if len(symbols) > 1:
+        print(f"[futures] 同時跑 {len(symbols)} 個交易對:{'、'.join(symbols)}(帳戶、心得、日誌各自獨立;Ctrl+C 全部結束)"
+              + (f";重設:{'、'.join(a.reset_symbols)}" if a.reset_symbols else ""), flush=True)
+        return run_multi(symbols, lambda s: [sys.executable, "-m", "aitrader"] + _child_argv(a, s))
     model = _make_model(a.model, reflect_model=a.reflect_model)
     print(f"[futures] 模型 {model_label(model)}")
     path = a.state or os.path.join("state", _default_name(a, "futures") + ".json")
@@ -297,7 +304,66 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
 
 # ------------------------------ futures-replay ------------------------------
 
+RESET_ALL = "*"
+
+
+def _resolve_reset(a, symbols: List[str]) -> None:
+    """--reset 不加值 = 全部;加值 = 只重設列出的交易對(必須在 --symbol 之中)。a.reset 轉成這個交易對是否重設。"""
+    if a.reset is None or a.reset == RESET_ALL:
+        a.reset_symbols = list(symbols) if a.reset else []
+    else:
+        a.reset_symbols = parse_symbols(a.reset)
+        extra = [s for s in a.reset_symbols if s not in symbols]
+        if extra:
+            raise ValueError(f"--reset 指定的 {'、'.join(extra)} 不在 --symbol 之中")
+    a.reset = a.symbol in a.reset_symbols
+
+
+def _child_argv(a, symbol: str) -> List[str]:
+    """子程式的參數:只留這個交易對;--reset(不帶值,子程式只認得自己)與 --reset-memory 只傳給要重設的交易對
+    (--reset-memory 單獨出現會被子程式判為錯誤)。"""
+    argv = [x for x in drop_option(replace_symbol(a.argv, symbol), "--reset") if x != "--reset-memory"]
+    if symbol in a.reset_symbols:
+        argv += ["--reset"] + (["--reset-memory"] if a.reset_memory else [])
+    return argv
+
+
+def _symbols(a) -> List[str]:
+    """--symbol 可用逗號指定多個;多個時不能共用 --state / --journal。"""
+    symbols = parse_symbols(a.symbol)
+    if len(symbols) > 1 and (getattr(a, "state", None) or getattr(a, "journal", None)):
+        raise ValueError("多個交易對時不能指定 --state / --journal(會自動依交易對分開存放)")
+    a.symbol = symbols[0]
+    return symbols
+
+
 def cmd_futures_replay(a) -> int:
+    symbols = _symbols(a)
+    if len(symbols) > 1:  # 回放依序執行,最後列出對照表
+        rows, code = [], 0
+        for s in symbols:
+            print(f"===== {s}", flush=True)
+            a.symbol = s
+            try:
+                r = _futures_replay_one(a)
+            except LLMConfigError:
+                raise  # 金鑰 / 模型設定錯誤:其他交易對也會失敗
+            except (ValueError, OSError, LLMError) as e:  # 單一交易對失敗(例如沒有這個合約):繼續跑下一個
+                print(f"錯誤:{e}", file=sys.stderr)
+                r = (1, None)
+            code = max(code, r[0])
+            rows.append((s, r[1]))
+        print("===== 對照")
+        for s, r in rows:
+            print(f"{s:10s} " + (f"報酬 {r.return_pct:+7.2f}%  持有 {r.hold_return_pct:+7.2f}%  最大回撤 {r.max_drawdown_pct:5.2f}%"
+                                 f"  成交 {r.trades:3d}  停損 {r.stop_losses}  追蹤停損 {r.trailing_stops}"
+                                 if r else "(失敗)"))
+        return code
+    return _futures_replay_one(a)[0]
+
+
+def _futures_replay_one(a):
+    """回傳 (結束代碼, FuturesReplayResult 或 None)。"""
     money = make_money(a.currency, a.twd_rate)
     rc = _risk_cfg(a, money)
     if a.every < 1:
@@ -341,7 +407,7 @@ def cmd_futures_replay(a) -> int:
     if isinstance(model, CachedModel):
         print(f"Gemini 實際呼叫 {model.misses} 次、快取命中 {model.hits} 次")
     print(f"決策日誌:{journal}(可用 report 檢視)")
-    return 0
+    return 0, r
 
 
 # ------------------------------ report ------------------------------
@@ -422,7 +488,9 @@ def report_futures(path: str, recs: List[dict], money: Money = Money()) -> int:
 # ------------------------------ 參數 ------------------------------
 
 def _add_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--symbol", default="BTCUSDT", help="Binance USDT 永續合約(預設 BTCUSDT)")
+    p.add_argument("--symbol", default="BTCUSDT",
+                   help="Binance USDT 永續合約,多個用逗號分隔(如 SOLUSDT,ETHUSDT);多個時各自獨立帳戶,"
+                        "模擬盤同時執行、回放依序執行(預設 BTCUSDT)")
     p.add_argument("--interval", default="1h", help="多久問一次 AI(K 線週期,預設 1h;支援 " + "/".join(INTERVAL_SECS) + ")")
     p.add_argument("--model", choices=["gemini", "rule"], default="gemini",
                    help="gemini=Gemini API;rule=離線規則基準(均線 + MACD 順勢),不花錢(預設 gemini)")
@@ -485,7 +553,9 @@ def add_parsers(sub) -> None:
                    help="兩次決策之間顯示狀態列(價格、持倉、未實現損益、剩餘額度)的間隔,如 5s、5m、1h;0=不顯示(預設 5m)")
     p.add_argument("--state", help="狀態檔(預設 state/futures_<SYMBOL>_<MODEL>[_nolearn].json)")
     p.add_argument("--journal", help="決策日誌(預設 journal/futures_<SYMBOL>_<MODEL>[_nolearn].jsonl)")
-    p.add_argument("--reset", action="store_true", help="忽略既有狀態,重新開始(預設沿用 AI 的心得)")
+    p.add_argument("--reset", nargs="?", const=RESET_ALL, default=None, metavar="SYMBOLS",
+                   help="忽略既有狀態,重新開始(預設沿用 AI 的心得);多個交易對時可指定只重設哪些,"
+                        "如 --reset ETHUSDT(逗號分隔),不加值則全部重設")
     p.add_argument("--reset-memory", action="store_true", help="搭配 --reset:連 AI 的心得也一起清除")
     p.add_argument("--max-steps", type=int, default=0, help="問 AI 幾次後結束,0=持續執行")
     p.add_argument("--news", action="store_true",

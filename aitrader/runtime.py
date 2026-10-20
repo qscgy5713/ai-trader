@@ -1,8 +1,10 @@
-"""長時間執行的共用工具:安全停止(SIGINT / SIGTERM)與可中斷的等待。"""
+"""長時間執行的共用工具:安全停止(SIGINT / SIGTERM / SIGHUP)與可中斷的等待。"""
 from __future__ import annotations
 
 import contextlib
+import os
 import signal
+import sys
 import time
 from typing import Optional
 
@@ -10,23 +12,32 @@ INTERVAL_SECS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h":
 
 
 class StopFlag:
-    """SIGINT / SIGTERM:第一次只設旗標,在安全點存檔結束;第二次才強制中斷。"""
+    """SIGINT / SIGTERM / SIGHUP(關閉視窗):第一次只設旗標,在安全點存檔結束;第二次才強制中斷。"""
 
     def __init__(self, tag: str = "paper") -> None:
         self.requested = False
         self.tag = tag
 
     def __call__(self, signum, frame) -> None:
+        if signum == getattr(signal, "SIGHUP", None):
+            # 終端機視窗已關閉:之後印字會出錯(EIO),導到 /dev/null,確保能存檔結束
+            sys.stdout = sys.stderr = open(os.devnull, "w")
         if self.requested:
             raise KeyboardInterrupt
         self.requested = True
-        print(f"\n[{self.tag}] 收到停止訊號,處理完目前這一步就存檔結束(再按一次強制結束)", flush=True)
+        try:
+            print(f"\n[{self.tag}] 收到停止訊號,處理完目前這一步就存檔結束(再按一次強制結束)", flush=True)
+        except OSError:
+            pass
 
 
 @contextlib.contextmanager
 def handle_signals(stop: StopFlag):
     old = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    # SIGHUP:關閉終端機視窗時也存檔再結束(預設行為是直接終止)
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
         try:
             old[sig] = signal.signal(sig, stop)
         except ValueError:  # 非主執行緒

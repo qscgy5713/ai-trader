@@ -402,6 +402,7 @@ def main(argv=None) -> int:
     p.set_defaults(fn=cmd_report)
 
     a = ap.parse_args(argv)
+    a.argv = list(sys.argv[1:] if argv is None else argv)  # 多交易對時用來組子程式的參數
     try:
         return a.fn(a)
     except LLMConfigError as e:
