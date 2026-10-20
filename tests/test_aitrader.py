@@ -86,6 +86,18 @@ class MarketTest(unittest.TestCase):
         self.assertEqual([c.close for c in k], [0.0, 1.0, 2.0, 3.0])  # 不含形成中的第 5 根
         self.assertIn("limit=5", g.call_args[0][0])
 
+    def test_fetch_klines_keeps_just_closed_candle_at_the_hour(self):
+        """整點剛過、交易所還沒產生新 K 線時,最後一根是剛收盤的,不能丟(曾因此用到舊一小時的資料)。"""
+        from aitrader import market
+        H = 3600_000
+        rows = lambda n: [[i * H, "1", "2", "0.5", str(i), "3", (i + 1) * H - 1] for i in range(n)]
+        with mock.patch.object(market, "_get", return_value=rows(5)), \
+                mock.patch.object(market.time, "time", return_value=5 * H / 1000):  # 05:00:00,第 5 根(04:00~)剛收盤
+            self.assertEqual([c.close for c in market.fetch_klines("X", "1h", 4)], [1.0, 2.0, 3.0, 4.0])
+        with mock.patch.object(market, "_get", return_value=rows(5)), \
+                mock.patch.object(market.time, "time", return_value=4.5 * H / 1000):  # 04:30,第 5 根形成中
+            self.assertEqual([c.close for c in market.fetch_klines("X", "1h", 4)], [0.0, 1.0, 2.0, 3.0])
+
 
 class ParseDecisionTest(unittest.TestCase):
     def test_valid(self):

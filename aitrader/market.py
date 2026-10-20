@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import urllib.request
 from typing import Dict, List, NamedTuple, Tuple
 
@@ -27,7 +28,8 @@ def _get(url: str):
 def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200, futures: bool = False) -> List[Candle]:
     """最近 limit 根「已收盤」K 線(>1000 自動往回分頁)。futures=True 取 USDT 永續合約的 K 線。
 
-    不帶 endTime 的第一頁最後一根是形成中的 K 線,直接丟掉,並多要一根補回。"""
+    不帶 endTime 的第一頁最後一根通常是形成中的 K 線:依 closeTime 判斷(還沒到收盤時間才丟),並多要一根補回。
+    整點剛過的瞬間,交易所可能還沒產生新 K 線,此時最後一根是「剛收盤」的那根,不能丟(否則會用到舊一小時的資料)。"""
     if limit < 1:
         raise ValueError("limit 必須 >= 1")
     out: List[Candle] = []
@@ -39,13 +41,21 @@ def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200, futures: b
         data = _get(f"{url}?symbol={symbol}&interval={interval}&limit={n}{end}")
         if not data:
             break
-        rows = data[:-1] if first else data
+        rows = (_drop_forming(data) if first else data)
         out = [Candle(k[0] / 1000, *(float(x) for x in k[1:6])) for k in rows] + out
         end = f"&endTime={data[0][0] - 1}"
         if len(data) < n:
             break
         first = False
     return out[-limit:]
+
+
+def _drop_forming(data: list) -> list:
+    """去掉還沒收盤的 K 線(closeTime 在現在之後);沒有 closeTime 欄位時照舊丟掉最後一根。"""
+    if not data or len(data[-1]) < 7:
+        return data[:-1]
+    now_ms = time.time() * 1000
+    return [k for k in data if float(k[6]) < now_ms]
 
 
 def fetch_price(symbol: str) -> float:
