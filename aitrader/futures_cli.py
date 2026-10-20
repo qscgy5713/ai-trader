@@ -53,8 +53,10 @@ def _new_agent(a, rc: FuturesRiskConfig, money: Money) -> FuturesAgent:
 
 
 def _default_name(a, prefix: str) -> str:
-    """預設檔名;--no-learn 加後綴,方便同時跑「有學習 / 無學習」兩個版本比較。"""
-    return f"{prefix}_{a.symbol}_{a.model}" + ("_nolearn" if a.no_learn else "")
+    """預設檔名;非預設風格(auto 以外)與 --no-learn 加後綴,方便同時跑不同版本比較(各自獨立帳戶)。"""
+    style = getattr(a, "style", "auto")
+    return (f"{prefix}_{a.symbol}_{a.model}" + ("" if style == "auto" else f"_{style}")
+            + ("_nolearn" if a.no_learn else ""))
 
 
 def _budget_warning(rc: FuturesRiskConfig, equity: float, money: Money) -> str:
@@ -551,8 +553,8 @@ def add_parsers(sub) -> None:
     p.add_argument("--check-every", type=float, default=30, help="檢查強平 / 停損 / 資金費的間隔秒數(預設 30)")
     p.add_argument("--status-every", default="5m",
                    help="兩次決策之間顯示狀態列(價格、持倉、未實現損益、剩餘額度)的間隔,如 5s、5m、1h;0=不顯示(預設 5m)")
-    p.add_argument("--state", help="狀態檔(預設 state/futures_<SYMBOL>_<MODEL>[_nolearn].json)")
-    p.add_argument("--journal", help="決策日誌(預設 journal/futures_<SYMBOL>_<MODEL>[_nolearn].jsonl)")
+    p.add_argument("--state", help="狀態檔(預設 state/futures_<SYMBOL>_<MODEL>[_<STYLE>][_nolearn].json;auto 風格不加)")
+    p.add_argument("--journal", help="決策日誌(預設 journal/futures_<SYMBOL>_<MODEL>[_<STYLE>][_nolearn].jsonl)")
     p.add_argument("--reset", nargs="?", const=RESET_ALL, default=None, metavar="SYMBOLS",
                    help="忽略既有狀態,重新開始(預設沿用 AI 的心得);多個交易對時可指定只重設哪些,"
                         "如 --reset ETHUSDT(逗號分隔),不加值則全部重設")

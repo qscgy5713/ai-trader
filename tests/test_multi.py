@@ -120,6 +120,15 @@ class MultiSymbolTest(unittest.TestCase):
         with self.assertRaises(OSError):
             run_multi(["SOLUSDT", "BADUSDT"], cmd, io.StringIO())  # SOL 已啟動:要被收掉,不能留下孤兒程式
 
+    def test_default_name_by_style(self):
+        import argparse
+        from aitrader.futures_cli import _default_name
+        n = lambda **k: _default_name(argparse.Namespace(symbol="SOLUSDT", model="gemini", no_learn=False, **k), "futures")
+        self.assertEqual(n(style="auto"), "futures_SOLUSDT_gemini")  # 預設不變:既有帳戶照常接續
+        self.assertEqual(n(style="balanced"), "futures_SOLUSDT_gemini_balanced")  # 可與 auto 同時跑
+        self.assertEqual(_default_name(argparse.Namespace(symbol="X", model="rule", no_learn=True, style="aggressive"), "f"),
+                         "f_X_rule_aggressive_nolearn")
+
     def test_drop_option(self):
         from aitrader.multi import drop_option
         self.assertEqual(drop_option(["a", "--reset", "X", "--news"], "--reset"), ["a", "--news"])
