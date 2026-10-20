@@ -829,14 +829,23 @@ class NewsTest(unittest.TestCase):
         self.assertIsNotNone(rec["trade"])  # 新聞失敗照常交易
         for i in range(1, 4):
             a.decide(m, "SOLUSDT", "1h", c, 100, TS + i * 60)
-        self.assertEqual(len(m.news_calls), 3)  # 當天最多 3 次
+        self.assertEqual(len(m.news_calls), 2)  # 當天最多 2 輪(逾時等錯誤不在輪內重試)
         m3 = NewsModel()
         m3.search_news = lambda system, prompt: (NewsModel().search_news(system, prompt)[0], dict(META, sources=[]))
         c3 = FuturesAgent(acct(), FuturesRiskConfig())
         c3.news_enabled = True
         self.assertIn("沒有附上引用來源", c3.decide(m3, "SOLUSDT", "1h", c, 100, TS)["news"]["error"])
         self.assertIsNone(c3.news)  # 無來源的結果不採用
-        self.assertEqual(c3.decide(m3, "SOLUSDT", "1h", c, 100, TS + 60)["news"]["meta"]["tokens_out"], 1)  # 仍記用量
+        self.assertEqual(c3.decide(m3, "SOLUSDT", "1h", c, 100, TS + 60)["news"]["meta"]["tokens_out"], 3)  # 輪內重試 3 次,仍記用量
+        self.assertIsNone(c3.decide(m3, "SOLUSDT", "1h", c, 100, TS + 120)["news"])  # 2 輪用完,當天不再搜
+        # API 偶爾漏回來源:同一輪立即重試,第 2 次有來源就採用
+        m4, seq = NewsModel(), [[], [{"title": "coindesk.com", "uri": "u"}]]
+        m4.search_news = lambda system, prompt: (NewsModel().search_news(system, prompt)[0], dict(META, sources=seq.pop(0)))
+        c4 = FuturesAgent(acct(), FuturesRiskConfig())
+        c4.news_enabled = True
+        r4 = c4.decide(m4, "SOLUSDT", "1h", c, 100, TS)["news"]
+        self.assertIsNone(r4["error"])
+        self.assertEqual((r4["meta"]["calls"], r4["sources"][0]["reputable"]), (2, True))
         m2 = NewsModel(news_errors=[LLMConfigError("400 不支援搜尋")])
         b = FuturesAgent(acct(), FuturesRiskConfig())
         b.news_enabled = True

@@ -28,7 +28,8 @@ from .prompt import (FUTURES_REFLECTION_SYSTEM, NEWS_SYSTEM, build_futures_promp
                      is_reputable_source)
 from .state import append_jsonl
 
-NEWS_MAX_ATTEMPTS = 3  # 每日新聞搜尋失敗最多重試幾次(之後當天放棄,不影響交易)
+NEWS_MAX_ATTEMPTS = 2  # 每日新聞每天最多嘗試幾輪(每輪在不同的決策時間;之後當天放棄,不影響交易)
+NEWS_TRIES_PER_ROUND = 3  # 每輪立即重試幾次:API 偶爾漏回引用來源(實測約 1/3),內容其實有搜尋過
 NEWS_MAX_AGE_SECS = 36 * 3600  # 新聞摘要超過這個時間就不再附給 AI
 BANKRUPT_PCT = 1.0  # 權益低於初始資金此 % 視為爆倉,停止交易
 MIN_LEVERAGE = 0.1  # 額度限制後可開槓桿低於此值就不開倉
@@ -282,7 +283,7 @@ class FuturesAgent:
         return self._finish(rec, price, journal)
 
     def refresh_news(self, model, symbol: str, ts: float, journal: Optional[str]) -> Optional[dict]:
-        """每天(UTC)第一次決策時搜尋一次新聞;回傳日誌紀錄(沒做則 None)。失敗不影響交易,當天最多重試 NEWS_MAX_ATTEMPTS 次。"""
+        """每天(UTC)第一次決策時搜尋一次新聞;回傳日誌紀錄(沒做則 None)。失敗不影響交易,當天最多 NEWS_MAX_ATTEMPTS 輪。"""
         if not getattr(model, "can_search_news", False) or (self.news and self.news["day"] == self.day):
             return None
         if self.news_attempt_day != self.day:
@@ -292,12 +293,8 @@ class FuturesAgent:
         rec = {"kind": "futures_news", "ts": ts, "day": self.day, "summary": None, "sentiment": None, "events": None,
                "sources": None, "meta": None, "error": None}
         try:
-            brief, meta = model.search_news(NEWS_SYSTEM, build_news_prompt(symbol, ts))
+            brief, meta, sources = self._search_news(model, symbol, ts, rec)
             events = [asdict(e) for e in brief.events]
-            sources = meta.pop("sources", [])
-            rec["meta"] = meta  # 不採用時也記下用量(有花錢)
-            if not sources:  # 沒有可查核的引用來源:可能是模型憑記憶回答,不採用
-                raise LLMError("搜尋結果沒有附上引用來源,無法查核,不採用")
             for s in sources:
                 s["reputable"] = is_reputable_source(s.get("title", ""))
             self.news = {"day": self.day, "ts": ts, "summary": brief.summary, "sentiment": brief.sentiment,
@@ -309,6 +306,24 @@ class FuturesAgent:
         if journal:
             append_jsonl(journal, rec)
         return rec
+
+    @staticmethod
+    def _search_news(model, symbol: str, ts: float, rec: dict):
+        """搜尋新聞並要求附上引用來源;沒有來源時立即重試(最多 NEWS_TRIES_PER_ROUND 次)。
+        用量累計在 rec["meta"](不採用的也有花錢)。"""
+        used = {"calls": 0, "tokens_in": 0, "tokens_out": 0}
+        rec["meta"] = used
+        for _ in range(NEWS_TRIES_PER_ROUND):
+            brief, meta = model.search_news(NEWS_SYSTEM, build_news_prompt(symbol, ts))
+            sources = meta.pop("sources", [])
+            used["calls"] += 1
+            used["tokens_in"] += meta.get("tokens_in", 0)
+            used["tokens_out"] += meta.get("tokens_out", 0)
+            rec["meta"] = dict(meta, **used)
+            if sources:
+                return brief, rec["meta"], sources
+        # 沒有可查核的引用來源:可能是模型憑記憶回答,不採用
+        raise LLMError(f"搜尋 {NEWS_TRIES_PER_ROUND} 次都沒有附上引用來源,無法查核,不採用")
 
     def news_view(self, ts: float) -> Optional[dict]:
         """給 AI 看的新聞摘要;未開啟、沒有或太舊時回 None。"""
