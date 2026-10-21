@@ -50,6 +50,7 @@ class FuturesRiskConfig:
     min_stop_distance_pct: float = 0.5  # 停損距離(價格 %)下限
     trail_activate_pct: float = 2.0  # 持倉獲利達錢包此 % 啟動追蹤停損;0 = 不啟用
     trail_distance_pct: float = 1.5  # 從獲利高點回吐超過錢包此 % 就平倉(最低約保本,未計手續費)
+    alert_move_pct: float = 1.5  # 有持倉時,價格自上次決策往不利方向走超過此 % 就立刻多問一次 AI;0 = 關閉
 
     def validate(self) -> None:
         if not 0 < self.max_leverage <= 10:
@@ -72,6 +73,8 @@ class FuturesRiskConfig:
             raise ValueError("min_stop_distance 需在 (0, 50)")
         if self.trail_activate_pct < 0 or not 0 < self.trail_distance_pct < 100:
             raise ValueError("trail_activate 不可為負;trail_distance 需在 (0, 100)")
+        if not 0 <= self.alert_move_pct < 50:
+            raise ValueError("alert_move 需在 [0, 50)")
 
 
 class FuturesAgent:
@@ -91,6 +94,9 @@ class FuturesAgent:
         self.news: Optional[dict] = None  # 最近一次成功的新聞摘要
         self.news_attempt_day, self.news_attempts = "", 0
         self.news_cache: Optional[str] = None  # 共用新聞檔:同交易對的多個帳戶(例如不同風格)一天只搜一次
+        # 急跌檢查:上次決策時的價格;每次例行決策後可觸發一次(避免來回震盪時重複呼叫)
+        self.last_decision_price: Optional[float] = None
+        self.alert_armed = True
 
     # ---- 狀態 ----
     def _new_day(self, ts: float, price: float) -> None:
@@ -241,12 +247,31 @@ class FuturesAgent:
         return rec
 
     # ---- 模型決策 ----
+    def alert_move(self, price: float) -> Optional[float]:
+        """價格自上次決策往持倉不利方向走了多少 %;達到 alert_move_pct 且這段期間還沒觸發過才回傳,否則 None。"""
+        a, lim, ref = self.acct, self.cfg.alert_move_pct, self.last_decision_price
+        if not (lim and self.alert_armed and ref) or abs(a.qty) < DUST:
+            return None
+        move = (ref - price) / ref * 100 if a.qty > 0 else (price - ref) / ref * 100
+        return round(move, 2) if move >= lim - 1e-9 else None
+
+    def alert_price(self) -> Optional[float]:
+        """急跌檢查的觸發價(回放用:連續走勢穿越此價時檢查);不會觸發時回 None。"""
+        a, lim, ref = self.acct, self.cfg.alert_move_pct, self.last_decision_price
+        if not (lim and self.alert_armed and ref) or abs(a.qty) < DUST:
+            return None
+        return ref * (1 - lim / 100) if a.qty > 0 else ref * (1 + lim / 100)
+
     def decide(self, model, symbol: str, interval: str, candles: List[Candle], price: float, ts: float,
-               funding_rate: Optional[float] = None, journal: Optional[str] = None) -> dict:
+               funding_rate: Optional[float] = None, journal: Optional[str] = None,
+               alert: Optional[float] = None) -> dict:
+        """alert:急跌檢查(價格不利變動 %);None 表示例行的 K 線收盤決策。"""
         self._new_day(ts, price)
         eq0 = self.acct.equity(price)
         self.memory.settle(ts, price, eq0)
         rec = self._rec(price, ts, getattr(model, "name", "?"))
+        if alert is not None:
+            rec["alert"] = {"move_pct": alert, "from_price": self.last_decision_price}
         review = self.memory.review
         if review and self.news and self.news["day"] == review["day_utc"] and "market_news" not in review:
             review["market_news"] = {k: self.news[k] for k in ("summary", "sentiment", "events")}  # 檢討時一併參考當天消息面
@@ -262,8 +287,17 @@ class FuturesAgent:
             why, code, target = "今日已觸發強平或單日虧損上限,停止交易至明天(UTC)", "halted", None
         else:
             feats = features(candles)
+            cons = self._constraints(price)
+            if alert is not None:
+                cons["urgent_check"] = {
+                    "trigger": f"price moved {alert:.2f}% against the position since the last decision "
+                               f"({self.last_decision_price:g} -> {price:g})",
+                    "note": "This is an extra check outside the regular schedule. You may reduce part of the position "
+                            "(same direction with a lower leverage, e.g. half), close it (FLAT), keep it (HOLD) or reverse. "
+                            "A partial reduction can be added back at a later regular decision if conditions recover. "
+                            "Reducing a position does not use up trades_left_today."}
             prompt = build_futures_prompt(symbol, interval, feats, self.position_info(price), funding_rate,
-                                          self._constraints(price), self.memory.prompt_view() if self.learn else None,
+                                          cons, self.memory.prompt_view() if self.learn else None,
                                           self.news_view(ts))
             decision = None
             try:
@@ -275,9 +309,14 @@ class FuturesAgent:
                 rec["error"] = str(e)
             target, why, code = self._filter(decision, price)
         stop_pct = self.sizing(price)[0]
+        reduce = target is not None and self._is_reduction(target, price)
         t = self.acct.rebalance(target, price, ts, why) if target is not None else None
+        # 急跌檢查後要等下一次例行決策才會再觸發;但這次檢查沒拿到 AI 決策(逾時等)就保留,讓呼叫端稍後重試
+        self.last_decision_price = price if (alert is None or rec["decision"] is not None) else self.last_decision_price
+        self.alert_armed = alert is None or rec["decision"] is None
         if t:
-            self.trades_today += 1
+            if not reduce:  # 減倉 / 平倉是降低風險,不占每日交易次數
+                self.trades_today += 1
             self.trail_peak = None  # 倉位變了:追蹤停損重新計算
             if target:
                 self.pos_stop_pct = stop_pct  # 新倉位的停損依開倉當下的剩餘額度
@@ -286,7 +325,8 @@ class FuturesAgent:
             side = self.position_info(price)
             self.memory.record_decision(
                 ts, price, eq0, d, code, f"{d['leverage']:g}x" if d["action"] in ("LONG", "SHORT") else None,
-                {"position_after": side["side"] + (f" {side['leverage']:g}x" if side["side"] != "FLAT" else "")})
+                {"position_after": side["side"] + (f" {side['leverage']:g}x" if side["side"] != "FLAT" else ""),
+                 **({"urgent_check_after_move_pct": alert} if alert is not None else {})})
         rec.update(action_taken=why, code=code, trade=asdict(t) if t else None)
         return self._finish(rec, price, journal)
 
@@ -403,14 +443,14 @@ class FuturesAgent:
             target = lev * 100 * (1 if d.action == "LONG" else -1)
         if d.action == "FLAT" and abs(self.acct.qty) < DUST:
             return None, "已是空手", "noop"
-        if d.action != "FLAT" and cap < MIN_LEVERAGE:
+        if d.action != "FLAT" and cap < MIN_LEVERAGE and not self._is_reduction(target, price):  # 減倉照樣放行
             return None, "今日剩餘虧損額度不足,不開新倉", "budget_exhausted"
         if d.confidence < c.min_confidence:
             return None, f"信心 {d.confidence:.2f} 低於門檻 {c.min_confidence:g}", "low_confidence"
         same_side = target != 0 and cur != 0 and (target > 0) == (cur > 0)
         if same_side and abs(target - cur) < c.min_change_pct:
             return None, f"已接近目標:目標 {target / 100:+.2f} 倍、目前 {cur / 100:+.2f} 倍", "noop"
-        if self.trades_today >= c.max_trades_per_day:
+        if self.trades_today >= c.max_trades_per_day and not self._is_reduction(target, price):
             return None, f"今日交易已達 {c.max_trades_per_day} 次上限", "max_trades"
         note = ""
         if d.action != "FLAT" and d.leverage > cap:
@@ -418,6 +458,11 @@ class FuturesAgent:
                     else f"(依今日剩餘額度,上限 {cap:.2f} 倍)")
         label = {"LONG": "做多", "SHORT": "做空", "FLAT": "平倉"}[d.action]
         return target, f"執行 {label} {abs(target) / 100:.2f} 倍{note}", "execute"
+
+    def _is_reduction(self, target: float, price: float) -> bool:
+        """目標曝險是否只是同方向縮小或平倉(不含反手)。"""
+        cur = self.acct.exposure_pct(price)
+        return cur != 0 and abs(target) < abs(cur) and (target == 0 or (target > 0) == (cur > 0))
 
     # ---- 日誌 ----
     def _rec(self, price: float, ts: float, model_name: Optional[str]) -> dict:
@@ -439,7 +484,8 @@ class FuturesAgent:
                 "trades_today": self.trades_today, "halted_day": self.halted_day, "pos_stop_pct": self.pos_stop_pct,
                 "trail_peak": self.trail_peak,
                 "day_start_costs": self.day_start_costs, "memory": self.memory.to_dict(),
-                "news": self.news, "news_attempt_day": self.news_attempt_day, "news_attempts": self.news_attempts}
+                "news": self.news, "news_attempt_day": self.news_attempt_day, "news_attempts": self.news_attempts,
+                "last_decision_price": self.last_decision_price, "alert_armed": self.alert_armed}
 
     @classmethod
     def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True, style: str = "auto") -> "FuturesAgent":
@@ -454,6 +500,8 @@ class FuturesAgent:
             a.memory = LearningMemory.from_dict(d.get("memory"), fill_label=None)
             a.news = d.get("news") if isinstance(d.get("news"), dict) else None
             a.news_attempt_day, a.news_attempts = str(d.get("news_attempt_day", "")), int(d.get("news_attempts", 0))
+            ldp = d.get("last_decision_price")
+            a.last_decision_price, a.alert_armed = (None if ldp is None else float(ldp)), bool(d.get("alert_armed", True))
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(f"合約狀態檔格式錯誤:{e!r}") from e
         return a
@@ -480,6 +528,7 @@ class FuturesReplayResult:
     funding_paid: float
     fees_paid: float
     reflections: int  # 成功的每日檢討次數
+    alerts: int  # 急跌檢查次數
     stopped_early: bool  # 達到 max_calls 或爆倉而提前結束
 
 
@@ -496,7 +545,7 @@ def futures_replay(model, symbol: str, interval: str, candles: List[Candle], age
     start_price = end_price = candles[start + 1].open
     peak, max_dd = a.equity(start_price), 0.0
     counts = {"decisions": 0, "errors": 0, "trades": 0, "stop_loss": 0, "trailing_stop": 0, "liquidation": 0,
-              "daily_loss": 0, "reflections": 0}
+              "daily_loss": 0, "reflections": 0, "alerts": 0}
     stopped = False
     prev_close = candles[start].close
     times = [t for t, _ in funding]
@@ -535,6 +584,17 @@ def futures_replay(model, symbol: str, interval: str, candles: List[Candle], age
             counts["reflections"] += 1 if r["reflection"] and not r["reflection"]["error"] else 0
         path = candle_path(nxt.open, nxt.high, nxt.low, nxt.close)
         for prev, p in zip(path, path[1:]):
+            ap = agent.alert_price()
+            if ap is not None and min(prev, p) <= ap <= max(prev, p) and (max_calls is None or calls_used() < max_calls):
+                # 連續走勢先經過急跌觸發價:先檢查到觸發價為止的停損,再用已收盤的 K 線(不含這根)問一次
+                forced(ap, nxt.ts, prev)
+                move = agent.alert_move(ap)
+                if move is not None:
+                    r = agent.decide(model, symbol, interval, candles[:i + 1], ap, nxt.ts, None, journal, alert=move)
+                    counts["alerts"] += 1
+                    counts["errors"] += 1 if r["error"] else 0
+                    counts["trades"] += 1 if r["trade"] else 0
+                prev = ap
             forced(p, nxt.ts, prev)
         prev_close = end_price = nxt.close
         processed += 1
@@ -543,4 +603,5 @@ def futures_replay(model, symbol: str, interval: str, candles: List[Candle], age
                                (end_price / start_price - 1) * 100, max_dd * 100, counts["decisions"],
                                counts["errors"], counts["trades"], counts["stop_loss"], counts["trailing_stop"],
                                counts["liquidation"],
-                               counts["daily_loss"], a.funding_paid, a.fees_paid, counts["reflections"], stopped)
+                               counts["daily_loss"], a.funding_paid, a.fees_paid, counts["reflections"], counts["alerts"],
+                               stopped)

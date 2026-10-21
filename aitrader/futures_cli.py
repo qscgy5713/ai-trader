@@ -42,7 +42,7 @@ def _risk_cfg(a, money: Money) -> FuturesRiskConfig:
     min_conf = a.min_confidence if a.min_confidence is not None else STYLE_MIN_CONFIDENCE[a.style]
     c = FuturesRiskConfig(a.max_leverage, min_conf, a.min_change, a.stop_loss, a.daily_loss_limit,
                           a.max_trades, money.to_usdt(a.daily_loss_amount), a.risk_per_trade, a.min_stop_distance,
-                          a.trail_activate, a.trail_distance)
+                          a.trail_activate, a.trail_distance, a.alert_move)
     c.validate()
     return c
 
@@ -77,8 +77,9 @@ def _risk_line(a, rc: FuturesRiskConfig, money: Money) -> str:
     style = {"auto": "不指定(AI 自行判斷)", "conservative": "保守", "balanced": "平衡偏積極", "aggressive": "積極"}[a.style]
     trail = (f";追蹤停損:獲利達 {rc.trail_activate_pct:g}% 啟動、回吐 {rc.trail_distance_pct:g}% 平倉"
              if rc.trail_activate_pct else ";追蹤停損關閉")
+    alert = f";急跌 {rc.alert_move_pct:g}% 時立刻檢查" if rc.alert_move_pct else ""
     return (f"風格 {style}(信心門檻 {rc.min_confidence:g});槓桿上限 {rc.max_leverage:g} 倍{trail};單日虧損上限 {rc.daily_loss_limit_pct:g}%{amt}(先到為準);"
-            f"每筆最多用掉剩餘額度 {rc.risk_per_trade_pct:g}%")
+            f"每筆最多用掉剩餘額度 {rc.risk_per_trade_pct:g}%{alert}")
 
 
 def _hm(ts: float) -> str:
@@ -227,7 +228,7 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
     save()
     secs = INTERVAL_SECS[a.interval]
     steps = attempts = 0
-    retry_at = 0.0
+    retry_at = alert_retry_at = 0.0
     rate = None
     last_status = time.time()
     watch = DowntimeWatch(saved_ts)  # 接續時:距上次存檔太久也算中斷
@@ -258,6 +259,18 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
                     print(f"[futures] {_hm(now)} 標記價 {price}  " + _fmt_rec(r) + f"\n    {_fmt_pos(agent, price, money)}"
                           f"\n    {_fmt_summary(agent, price, money)}", flush=True)
                 bar_close = (now // secs) * secs
+                # 急跌:不等整點立刻多問一次 AI;例行決策已經到期就不重複問;沒拿到決策(逾時)時 2 分鐘後再試
+                move = agent.alert_move(price) if not (bar_close > last_bar) and now >= alert_retry_at else None
+                if move is not None:
+                    print(f"[futures] {_hm(now)} ⚡ 價格自上次決策不利變動 {move:.2f}%(門檻 {rc.alert_move_pct:g}%),立刻檢查",
+                          flush=True)
+                    candles = fetch_klines(a.symbol, a.interval, FETCH_BARS, futures=True)
+                    rec = agent.decide(model, a.symbol, a.interval, candles, price, now, rate, journal, alert=move)
+                    if rec.get("decision") is None:
+                        alert_retry_at = now + 120
+                    print(f"[futures] {_hm(now)} 標記價 {price}  " + _fmt_rec(rec) + f"\n    {_fmt_pos(agent, price, money)}"
+                          f"\n    {_fmt_summary(agent, price, money)}", flush=True)
+                    last_status = now
                 if bar_close > last_bar and now >= retry_at:
                     candles = fetch_klines(a.symbol, a.interval, FETCH_BARS, futures=True)
                     rec = agent.decide(model, a.symbol, a.interval, candles, price, now, rate, journal)
@@ -405,7 +418,7 @@ def _futures_replay_one(a):
     print(f"期末權益 {money.fmt(r.equity)} / 本金 {money.fmt(agent.acct.initial)}  報酬 {r.return_pct:+.2f}%"
           f"  同期持有 {r.hold_return_pct:+.2f}%  最大回撤 {r.max_drawdown_pct:.2f}%")
     print(f"AI 決策 {r.decisions} 次(錯誤 {r.model_errors})  成交 {r.trades} 筆;停損 {r.stop_losses} 次、"
-          f"追蹤停損 {r.trailing_stops} 次、"
+          f"追蹤停損 {r.trailing_stops} 次、急跌檢查 {r.alerts} 次、"
           f"單日上限 {r.daily_halts} 次、強平 {r.liquidations} 次")
     print(f"手續費 {money.fmt(r.fees_paid)}  資金費淨支付 {money.fmt(r.funding_paid, sign=True)}")
     if r.reflections:
@@ -530,6 +543,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="追蹤停損:持倉獲利達錢包此 %% 啟動,0=不啟用(預設 2)")
     g.add_argument("--trail-distance", type=float, default=1.5,
                    help="追蹤停損:從獲利高點回吐超過錢包此 %% 就平倉,最低約保本(未計手續費,預設 1.5)")
+    g.add_argument("--alert-move", type=float, default=1.5,
+                   help="急跌檢查:有持倉時價格自上次決策往不利方向走超過此 %% 就立刻多問一次 AI(可部分減倉);"
+                        "每次例行決策後最多觸發一次,0=關閉(預設 1.5)")
     g.add_argument("--min-stop-distance", type=float, default=0.5,
                    help="停損距離(價格 %%)下限,用來決定可開槓桿上限(預設 0.5)")
     p.add_argument("--no-learn", action="store_true",

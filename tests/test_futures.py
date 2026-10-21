@@ -139,8 +139,9 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(a.decide(SeqModel(), "X", "1h", cs, 100, TS)["code"], "hold")
         self.assertEqual(a.decide(SeqModel(LLMError("x")), "X", "1h", cs, 100, TS)["code"], "no_decision")
         self.assertEqual(a.decide(SeqModel(D("SHORT", 1)), "X", "1h", cs, 100, TS)["code"], "execute")
-        self.assertEqual(a.decide(SeqModel(D("FLAT")), "X", "1h", cs, 100, TS)["code"], "max_trades")
-        self.assertEqual(a.decide(SeqModel(D("FLAT")), "X", "1h", cs, 100, TS + 86400)["code"], "execute")
+        self.assertEqual(a.decide(SeqModel(D("FLAT")), "X", "1h", cs, 100, TS)["code"], "execute")  # 平倉不受次數限制
+        self.assertEqual(a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, TS)["code"], "max_trades")  # 開倉仍受限
+        self.assertEqual(a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, TS + 86400)["code"], "execute")  # 隔天重置
 
     def test_prompt_has_position_and_funding(self):
         a, cs = self.agent(), candles()
@@ -976,3 +977,63 @@ class ProcessReviewTest(unittest.TestCase):
             self.assertIn("Judge the PROCESS", s)
             self.assertIn("LUCKY", s)
             self.assertIn("do not take credit", s)
+
+
+class UrgentCheckTest(unittest.TestCase):
+    """急跌檢查:持倉往不利方向走超過門檻時,不等整點立刻多問一次 AI;可部分減倉,減倉不占交易次數。"""
+
+    def test_alert_move_trigger_and_once_per_regular_decision(self):
+        a = FuturesAgent(acct(), FuturesRiskConfig(alert_move_pct=1.5))
+        self.assertIsNone(a.alert_move(90))  # 空手不觸發
+        a.decide(SeqModel(D("LONG", 1)), "X", "1h", candles(), 100, TS)
+        self.assertIsNone(a.alert_move(99))  # -1%:未達門檻
+        self.assertIsNone(a.alert_move(103))  # 有利方向不觸發
+        self.assertEqual(a.alert_move(98.4), 1.6)
+        m = SeqModel(D("LONG", 0.5))
+        r = a.decide(m, "X", "1h", candles(), 98.4, TS + 600, alert=1.6)
+        payload = json.loads(m.calls[-1])
+        self.assertIn("urgent_check", payload["constraints"])
+        self.assertIn("reduce part", payload["constraints"]["urgent_check"]["note"])
+        self.assertEqual(r["alert"], {"move_pct": 1.6, "from_price": 100})
+        self.assertEqual(r["code"], "execute")
+        self.assertAlmostEqual(a.acct.exposure_pct(98.4), 50, delta=1)  # 減倉一半
+        self.assertIsNone(a.alert_move(90))  # 急跌檢查後要等下一次例行決策才會再觸發
+        a.decide(SeqModel(D("HOLD")), "X", "1h", candles(), 98, TS + 3600)
+        self.assertIsNotNone(a.alert_move(96))  # 例行決策後重新啟用,以新的決策價計算
+        b = FuturesAgent.from_dict(json.loads(json.dumps(a.to_dict())), FuturesRiskConfig(alert_move_pct=1.5))
+        self.assertEqual((b.last_decision_price, b.alert_armed), (98, True))
+        self.assertIsNone(FuturesAgent(acct(), FuturesRiskConfig(alert_move_pct=0)).alert_move(1))  # 0 = 關閉
+        short = FuturesAgent(acct(), FuturesRiskConfig(alert_move_pct=1.5))
+        short.decide(SeqModel(D("SHORT", 1)), "X", "1h", candles(), 100, TS)
+        self.assertEqual(short.alert_move(102), 2.0)  # 空單:上漲是不利方向
+
+    def test_reduction_not_counted_toward_daily_trades(self):
+        a = FuturesAgent(acct(), FuturesRiskConfig(max_trades_per_day=1, max_leverage=2))
+        a.decide(SeqModel(D("LONG", 2)), "X", "1h", candles(), 100, TS)
+        self.assertEqual(a.trades_today, 1)
+        self.assertEqual(a.decide(SeqModel(D("LONG", 1)), "X", "1h", candles(), 100, TS + 60)["code"], "execute")  # 減倉
+        self.assertEqual(a.trades_today, 1)  # 不占次數
+        self.assertEqual(a.decide(SeqModel(D("LONG", 2)), "X", "1h", candles(), 100, TS + 120)["code"], "max_trades")  # 加倉受限
+        self.assertEqual(a.decide(SeqModel(D("SHORT", 0.5)), "X", "1h", candles(), 100, TS + 180)["code"], "max_trades")  # 反手不算減倉
+
+    def test_replay_runs_alert_checks(self):
+        drop = [Candle(TS + i * 3600, 100, 100.5, 99.5, 100, 1) for i in range(70)]
+        drop += [Candle(TS + 70 * 3600, 100, 100.2, 97, 97.5, 1), Candle(TS + 71 * 3600, 97.5, 98, 97, 97.5, 1)]
+        m = SeqModel(D("LONG", 1), D("FLAT"))
+        agent = FuturesAgent(acct(), FuturesRiskConfig(alert_move_pct=1.5, stop_loss_pct=10, max_leverage=2))
+        r = futures_replay(m, "X", "1h", drop, agent, [], every=100)
+        self.assertEqual(r.alerts, 1)  # 第 70 根下探 97 → 觸發一次並平倉
+        self.assertLess(abs(agent.acct.qty), 1e-9)
+
+    def test_urgent_check_failure_keeps_armed_and_budget_allows_reduction(self):
+        a = FuturesAgent(acct(), FuturesRiskConfig(alert_move_pct=1.5, max_leverage=2))
+        a.decide(SeqModel(D("LONG", 2)), "X", "1h", candles(), 100, TS)
+        r = a.decide(SeqModel(LLMError("timeout")), "X", "1h", candles(), 98, TS + 60, alert=2.0)
+        self.assertIsNone(r["decision"])
+        self.assertEqual((a.alert_armed, a.last_decision_price), (True, 100))  # 沒拿到決策:保留,稍後可再試
+        self.assertEqual(a.alert_move(98), 2.0)
+        a.day_start_equity = a.acct.equity(98) * 1.0001  # 讓今日額度幾乎用完(可開槓桿 < 最低)
+        a.cfg.daily_loss_amount = a.acct.initial * 0.0001
+        self.assertLess(a.sizing(98)[1], 0.1)
+        self.assertEqual(a.decide(SeqModel(D("LONG", 1)), "X", "1h", candles(), 98, TS + 120, alert=2.0)["code"], "execute")  # 減倉放行
+        self.assertEqual(a.decide(SeqModel(D("LONG", 2)), "X", "1h", candles(), 98, TS + 180)["code"], "budget_exhausted")  # 加倉不行

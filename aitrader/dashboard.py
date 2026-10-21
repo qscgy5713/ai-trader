@@ -125,7 +125,7 @@ def account_view(acc: dict, journal_dir: str, mark: Optional[float], now: float)
                   "action": (r.get("decision") or {}).get("action"), "leverage": (r.get("decision") or {}).get("leverage"),
                   "confidence": (r.get("decision") or {}).get("confidence"),
                   "reason": (r.get("decision") or {}).get("reason") or r.get("action_taken") or r.get("error"),
-                  "taken": r.get("action_taken")}
+                  "taken": r.get("action_taken"), "alert": r.get("alert")}
                  for r in recs if r.get("kind") == "futures"][-30:]
     news = next((r for r in reversed(recs) if r.get("kind") == "futures_news" and not r.get("error")), None)
     usage: Dict[str, List[int]] = {"decide": [0, 0, 0], "reflect": [0, 0, 0], "news": [0, 0, 0]}
@@ -496,7 +496,7 @@ function decisions(){
   const all=[];D.accounts.forEach(a=>a.decisions.forEach(d=>all.push([a,d])));all.sort((x,y)=>y[1].ts-x[1].ts);
   const tb=el("table",{},el("tr",{},...["時間","帳戶","動作","信心","理由 / 結果"].map(h=>el("th",{},h))));
   for(const[a,d]of all.slice(0,40)){
-    const act=d.forced?"強制出場":(d.action||"-")+(d.leverage?" "+d.leverage+"x":"");
+    const act=(d.alert?"⚡急跌 ":"")+(d.forced?"強制出場":(d.action||"-")+(d.leverage?" "+d.leverage+"x":""));
     tb.append(el("tr",{},el("td",{},t(d.ts)),el("td",{},label(a)),el("td",{class:d.action==="LONG"?"up":d.action==="SHORT"||d.forced?"down":""},act),
       el("td",{class:"num"},d.confidence??"-"),el("td",{},(d.reason||"")+(d.taken&&!d.forced?" → "+d.taken:""))));
   }
