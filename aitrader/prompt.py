@@ -79,6 +79,15 @@ Task: write a short summary of the day, and return an UPDATED full list of at mo
 - Lessons must be concrete and actionable (e.g. about range width vs volatility, grid count vs fees, when to PAUSE or not reconfigure).
 - Keep earlier lessons that still hold; revise or drop ones contradicted by evidence. Fewer, better lessons are preferred.
 - One day is a small sample: do not draw strong conclusions from a single event; say so when evidence is weak.
+- Judge the PROCESS, not just the outcome. A winning trade can still be a bad decision and a losing one a good decision.
+  Each outcome has `worst_equity_pct` / `best_equity_pct` (the worst and best equity during that interval) and, when holding a
+  position, `closest_to_stop_pct` (how close price came to the stop-loss); the day has `intraday_worst_equity_pct` and
+  `closest_to_stop_pct`. If a profit came after a deep adverse move or after nearly hitting the stop, call it LUCKY and do NOT
+  endorse its leverage, sizing or holding behavior; prefer a lesson about reducing that risk instead.
+- Every lesson must still hold if the same situation had turned out the other way. Do not write lessons that merely
+  restate what worked today.
+- Exits listed in forced_exits (stop_loss / trailing_stop / daily_loss / liquidation) are executed automatically by the
+  program, not by your decisions; do not take credit for them, though you may note that the rule helped.
 - Only rely on the data provided. Write in Traditional Chinese.
 Respond with JSON only."""
 
@@ -223,5 +232,14 @@ Task: write a short summary of the day, and return an UPDATED full list of at mo
 - Lessons must be concrete and actionable (e.g. when direction calls were wrong, leverage vs volatility, flipping too often, holding through funding).
 - Keep earlier lessons that still hold; revise or drop ones contradicted by evidence. Fewer, better lessons are preferred.
 - One day is a small sample: do not draw strong conclusions from a single event; say so when evidence is weak.
+- Judge the PROCESS, not just the outcome. A winning trade can still be a bad decision and a losing one a good decision.
+  Each outcome has `worst_equity_pct` / `best_equity_pct` (the worst and best equity during that interval) and, when holding a
+  position, `closest_to_stop_pct` (how close price came to the stop-loss); the day has `intraday_worst_equity_pct` and
+  `closest_to_stop_pct`. If a profit came after a deep adverse move or after nearly hitting the stop, call it LUCKY and do NOT
+  endorse its leverage, sizing or holding behavior; prefer a lesson about reducing that risk instead.
+- Every lesson must still hold if the same situation had turned out the other way. Do not write lessons that merely
+  restate what worked today.
+- Exits listed in forced_exits (stop_loss / trailing_stop / daily_loss / liquidation) are executed automatically by the
+  program, not by your decisions; do not take credit for them, though you may note that the rule helped.
 - Only rely on the data provided. Write in Traditional Chinese.
 Respond with JSON only."""

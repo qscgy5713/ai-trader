@@ -139,6 +139,7 @@ class GridAgent:
                 self._close_engine()
             self.halted_day, event = self.day, "daily_loss"
         self.memory.on_tick(sum(1 for f in fills if f.level >= 0), event)
+        self.memory.track(self.equity(price))
         return fills, event
 
     def decide(self, model, symbol: str, interval: str, candles: List[Candle], price: float, ts: float,

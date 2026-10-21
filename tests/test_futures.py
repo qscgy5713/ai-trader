@@ -889,3 +889,47 @@ class NewsTest(unittest.TestCase):
         self.assertIn("2023-11-14 Reuters:某事件", s)
         self.assertIn("引用網站(主流來源 1/1):reuters.com ✓", s)
         self.assertIn(";每日新聞 輸入 1 / 輸出 1", s)
+
+
+class ProcessReviewTest(unittest.TestCase):
+    """檢討要能分辨「險勝」:記錄區間內最差權益與距停損最近的距離。"""
+
+    def test_lucky_win_is_visible_in_outcome_and_review(self):
+        from aitrader.memory import LearningMemory
+        a = FuturesAgent(acct(), FuturesRiskConfig(max_leverage=2, stop_loss_pct=3))
+        c = candles()
+        a.decide(SeqModel(D("LONG", 1)), "X", "1h", c, 100, TS)  # 做多 1 倍,停損約在 97(錢包 3% 以內)
+        stop = a.acct.stop_price(a.pos_stop_pct)
+        for p in (99.0, stop + 0.3, 99.5, 103.0):  # 一度接近停損,最後漲上去
+            self.assertIsNone(a.check(p, TS + 600))
+        a.decide(SeqModel(D("HOLD")), "X", "1h", c, 103, TS + 3600)
+        out = a.memory.history[-1]["outcome"]
+        self.assertGreater(out["equity_change_pct"], 0)  # 結果是賺
+        self.assertLess(out["worst_equity_pct"], -2)  # 但中途虧超過 2%
+        self.assertAlmostEqual(out["closest_to_stop_pct"], 0.3 / (stop + 0.3) * 100, places=1)
+        self.assertGreater(out["best_equity_pct"], out["equity_change_pct"] - 1e-9)
+        a.decide(SeqModel(D("HOLD")), "X", "1h", c, 103, TS + 86400)  # 換日:前一天整理成待檢討
+        rv = a.memory.review
+        self.assertLess(rv["intraday_worst_equity_pct"], -2)
+        self.assertLess(rv["closest_to_stop_pct"], 1)
+        m = LearningMemory.from_dict(json.loads(json.dumps(a.memory.to_dict())), fill_label=None)
+        self.assertEqual((m.day_eq_lo, m.day_stop_min), (a.memory.day_eq_lo, a.memory.day_stop_min))
+        d = a.memory.to_dict()
+        del d["day_eq_lo"], d["day_stop_min"]  # 舊版狀態檔
+        self.assertIsNone(LearningMemory.from_dict(d, fill_label=None).day_eq_lo)
+
+    def test_flat_has_no_stop_distance(self):
+        a = FuturesAgent(acct(), FuturesRiskConfig())
+        a.decide(SeqModel(D("FLAT")), "X", "1h", candles(), 100, TS)
+        a.check(95, TS + 60)
+        a.decide(SeqModel(D("HOLD")), "X", "1h", candles(), 100, TS + 3600)
+        out = a.memory.history[-1]["outcome"]
+        self.assertNotIn("closest_to_stop_pct", out)
+        self.assertEqual(out["worst_equity_pct"], 0)
+
+    def test_reflection_prompts_judge_process(self):
+        from aitrader.prompt import FUTURES_REFLECTION_SYSTEM, REFLECTION_SYSTEM
+        for s in (FUTURES_REFLECTION_SYSTEM, REFLECTION_SYSTEM):
+            self.assertIn("Judge the PROCESS", s)
+            self.assertIn("LUCKY", s)
+            self.assertIn("do not take credit", s)

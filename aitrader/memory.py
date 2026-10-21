@@ -41,6 +41,9 @@ class LearningMemory:
         self.grid_fills = 0  # 累計成交筆數(網格掛單)
         self.day_fills0 = 0  # 當日開始時的 grid_fills
         self.day_events: List[str] = []
+        # 盤中風險(檢討時區分「險勝」與「穩贏」):當日最低權益、當日最接近停損的距離(價格 %)
+        self.day_eq_lo: Optional[float] = None
+        self.day_stop_min: Optional[float] = None
 
     # ---- 記錄 ----
     def on_tick(self, grid_fills: int, event: Optional[str]) -> None:
@@ -49,6 +52,18 @@ class LearningMemory:
             self.day_events.append(event)
             if self.pending is not None:
                 self.pending["events"].append(event)
+
+    def track(self, equity: float, stop_distance_pct: Optional[float] = None) -> None:
+        """價格檢查點:記錄目前決策區間與當日的最低 / 最高權益,以及距停損最近的距離(有持倉時)。"""
+        p = self.pending
+        if p is not None:
+            p["_eq_lo"] = min(p.get("_eq_lo", equity), equity)
+            p["_eq_hi"] = max(p.get("_eq_hi", equity), equity)
+            if stop_distance_pct is not None:
+                p["_stop_min"] = min(p.get("_stop_min", stop_distance_pct), stop_distance_pct)
+        self.day_eq_lo = equity if self.day_eq_lo is None else min(self.day_eq_lo, equity)
+        if stop_distance_pct is not None:
+            self.day_stop_min = stop_distance_pct if self.day_stop_min is None else min(self.day_stop_min, stop_distance_pct)
 
     def record_decision(self, ts: float, price: float, equity: float, decision: Optional[dict], code: str,
                         params: Optional[str] = None, extra: Optional[dict] = None) -> None:
@@ -73,6 +88,12 @@ class LearningMemory:
         }
         if self.fill_label:
             entry["outcome"][self.fill_label] = self.grid_fills - p["_fills"]
+        if p["_equity"] and "_eq_lo" in p:  # 區間內最差 / 最好(只看結果會把險勝當成好決策)
+            lo, hi = min(p["_eq_lo"], equity), max(p["_eq_hi"], equity)
+            entry["outcome"]["worst_equity_pct"] = round((lo / p["_equity"] - 1) * 100, 3)
+            entry["outcome"]["best_equity_pct"] = round((hi / p["_equity"] - 1) * 100, 3)
+        if "_stop_min" in p:
+            entry["outcome"]["closest_to_stop_pct"] = round(p["_stop_min"], 2)
         self.history = (self.history + [entry])[-HISTORY_LEN:]
         self.day_log = (self.day_log + [entry])[-MAX_DAY_LOG:]
         self.pending = None
@@ -91,8 +112,13 @@ class LearningMemory:
             }
             if self.fill_label:
                 self.review[self.fill_label] = self.grid_fills - self.day_fills0
+            if day_start_equity and self.day_eq_lo is not None:
+                self.review["intraday_worst_equity_pct"] = round((min(self.day_eq_lo, equity) / day_start_equity - 1) * 100, 3)
+            if self.day_stop_min is not None:
+                self.review["closest_to_stop_pct"] = round(self.day_stop_min, 2)
             self.review_attempts = 0
         self.day_log, self.day_events, self.day_fills0 = [], [], self.grid_fills
+        self.day_eq_lo = self.day_stop_min = None
 
     # ---- 給模型看 ----
     def prompt_view(self) -> Optional[dict]:
@@ -116,7 +142,8 @@ class LearningMemory:
     # ---- 持久化 ----
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in ("history", "day_log", "pending", "lessons", "lessons_updated", "review",
-                                              "review_attempts", "grid_fills", "day_fills0", "day_events")}
+                                              "review_attempts", "grid_fills", "day_fills0", "day_events",
+                                              "day_eq_lo", "day_stop_min")}
 
     @classmethod
     def from_dict(cls, d: Optional[dict], fill_label: Optional[str] = "grid_fills") -> "LearningMemory":
@@ -129,6 +156,7 @@ class LearningMemory:
             m.lessons, m.lessons_updated = [str(x) for x in d["lessons"]], str(d["lessons_updated"])
             m.review_attempts, m.grid_fills, m.day_fills0 = int(d["review_attempts"]), int(d["grid_fills"]), int(d["day_fills0"])
             m.day_events = [str(x) for x in d["day_events"]]
+            m.day_eq_lo, m.day_stop_min = d.get("day_eq_lo"), d.get("day_stop_min")  # 舊版沒有
         except (KeyError, TypeError, ValueError) as ex:
             raise ValueError(f"學習紀錄格式錯誤:{ex!r}") from ex
         return m

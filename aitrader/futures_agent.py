@@ -188,7 +188,12 @@ class FuturesAgent:
         否則(模擬盤輪詢、跳空)以當下價格出場。強平一律以強平價成交(由交易所執行)。"""
         self._new_day(ts, price)
         a = self.acct
-        if abs(a.qty) < DUST:
+        flat = abs(a.qty) < DUST
+        stop = None if flat else a.stop_price(self.pos_stop_pct)
+        # 距停損的距離(價格 %);已越過停損記 0
+        dist = None if stop is None else max(0.0, (price - stop if a.qty > 0 else stop - price) / price * 100)
+        self.memory.track(a.equity(price), dist)
+        if flat:
             return None
         long = a.qty > 0
         self._update_trail(price)
