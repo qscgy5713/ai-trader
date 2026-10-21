@@ -285,6 +285,19 @@ def _last_reflection(journal: str) -> dict:
     return refl[-1]
 
 
+def cmd_dashboard(a) -> int:
+    from .dashboard import Dashboard, serve
+    srv = serve(Dashboard(a.state_dir, a.journal_dir, a.currency, a.twd_rate), a.host, a.port)
+    print(f"儀表板:http://localhost:{a.port}(Ctrl+C 結束;只讀取 {a.state_dir}/ 與 {a.journal_dir}/,不影響模擬盤)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
 def cmd_lessons(a) -> int:
     """查看 AI 的學習狀況;--import 從日誌最後一次成功的每日檢討匯入心得。"""
     if not os.path.exists(a.state):
@@ -394,6 +407,15 @@ def main(argv=None) -> int:
     p.add_argument("--import", dest="import_from", metavar="JOURNAL",
                    help="從日誌最後一次成功的每日檢討匯入心得;模擬盤執行中也可以(會在下一輪自動套用)")
     p.set_defaults(fn=cmd_lessons)
+
+    p = sub.add_parser("dashboard", help="本機儀表板:在瀏覽器看合約模擬盤的權益曲線、持倉、成交與 AI 決策")
+    p.add_argument("--port", type=int, default=8765, help="埠號(預設 8765)")
+    p.add_argument("--host", default="127.0.0.1", help="綁定位址(預設只限本機 127.0.0.1)")
+    p.add_argument("--state-dir", default="state")
+    p.add_argument("--journal-dir", default="journal")
+    p.add_argument("--currency", choices=["USDT", "TWD"], default="TWD", help="金額幣別(預設 TWD)")
+    p.add_argument("--twd-rate", type=float, help="USDT/TWD 匯率;不指定則從 MAX 取即時匯率")
+    p.set_defaults(fn=cmd_dashboard)
 
     p = sub.add_parser("report", help="檢視決策日誌(一般、網格、合約模式皆可)")
     p.add_argument("journal", help="日誌路徑,如 journal/paper_BTCUSDT_gemini.jsonl")

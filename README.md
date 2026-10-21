@@ -279,6 +279,23 @@ USDT 永續合約、單向持倉、全倉保證金。**只模擬,不下真單**;
 4. **風控過濾**:信心門檻、持倉上限、最小調整幅度、每日交易次數。
 5. **模擬成交**:市價成交,計入手續費與滑價;寫入決策日誌。
 
+## 儀表板(瀏覽器檢視)
+
+```bash
+python3 -m aitrader dashboard            # 開 http://localhost:8765(預設台幣;--currency USDT 改 USDT)
+```
+或在模擬盤指令加 `--dashboard`(預設 port 8765)順便開啟,不用另開分頁;同時跑多組時只要其中一組加,
+另一組也加的話會提示 port 已被使用、不影響交易。
+
+- 自動找出 `state/` 裡所有合約模擬盤帳戶,**預設只顯示執行中的**(停掉的幣種、沒開的風格按「含已停止」才顯示)。
+- 內容:各風格合計、每個帳戶的權益 / 持倉 / 停損價與距離 / 追蹤停利、權益曲線(金額或 %)、
+  各交易對 K 線(含成交量、成交標記與持倉的進場 / 停損 / 追蹤停利線,可拖曳縮放)、風格對照表(報酬、最大回撤、平倉勝率、手續費)、
+  最近 40 筆決策與理由、心得與當日新聞(含來源)、近 24 小時 AI 用量。帳戶資料每 15 秒更新;
+  **現價與 K 線每 3 秒更新**(價格變動時閃綠 / 紅,標題旁顯示幾秒前更新),K 線可切換 1m / 5m / 15m / 1h(記住選擇),
+  最後一根是正在形成的(只供顯示;AI 決策仍只看已收盤的 K 線),更新時只改最後幾根,拖曳 / 縮放的畫面不會跳。
+- 只讀不寫、預設只綁 127.0.0.1;圖表程式庫(Chart.js、TradingView Lightweight Charts)從 CDN 載入,沒網路時只顯示表格。
+- 追蹤停利價以預設的 `--trail-distance` 估算;執行中的帳戶以即時標記價格計算權益。
+
 ## 長時間執行(避免電腦睡眠)
 
 模擬盤要一直執行才有意義:電腦睡眠時不會檢查停損、不會問 AI,醒來才用當下價格處理,成績會失真
@@ -315,9 +332,10 @@ aitrader/
   currency.py   USDT / 台幣換算與顯示
   runtime.py    安全停止(訊號)與可中斷等待
   multi.py      多交易對:每個交易對一個子程式、輸出加前綴
+  dashboard.py  本機儀表板(python3 -m aitrader dashboard)
   state.py      狀態原子寫入、檔案鎖、決策日誌
   cli.py        命令列入口(python3 -m aitrader)
-tests/          單元測試(Gemini 以模擬 HTTP 回應測試,不需金鑰;test_grid.py 網格、test_futures.py 合約、test_multi.py 多交易對)
+tests/          單元測試(Gemini 以模擬 HTTP 回應測試,不需金鑰;test_grid.py 網格、test_futures.py 合約、test_multi.py 多交易對、test_dashboard.py 儀表板)
 state/ journal/ cache/   執行時產生(已 gitignore)
 doc/            過程文件
 ```

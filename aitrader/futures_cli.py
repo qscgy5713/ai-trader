@@ -155,6 +155,9 @@ def cmd_futures(a) -> int:
         raise ValueError("--news 需要 --model gemini(要用 Google 搜尋)")
     symbols = _symbols(a)
     _resolve_reset(a, symbols)  # 多個交易對時由 _child_argv 只把 --reset 傳給要重設的交易對
+    if a.dashboard:  # 由主程式開(多個交易對時子程式不再開)
+        from .dashboard import start_background
+        start_background(a.dashboard, a.currency, a.twd_rate)
     if len(symbols) > 1:
         print(f"[futures] 同時跑 {len(symbols)} 個交易對:{'、'.join(symbols)}(帳戶、心得、日誌各自獨立;Ctrl+C 全部結束)"
               + (f";重設:{'、'.join(a.reset_symbols)}" if a.reset_symbols else ""), flush=True)
@@ -326,7 +329,8 @@ def _resolve_reset(a, symbols: List[str]) -> None:
 def _child_argv(a, symbol: str) -> List[str]:
     """子程式的參數:只留這個交易對;--reset(不帶值,子程式只認得自己)與 --reset-memory 只傳給要重設的交易對
     (--reset-memory 單獨出現會被子程式判為錯誤)。"""
-    argv = [x for x in drop_option(replace_symbol(a.argv, symbol), "--reset") if x != "--reset-memory"]
+    argv = [x for x in drop_option(drop_option(replace_symbol(a.argv, symbol), "--reset"), "--dashboard")
+            if x != "--reset-memory"]
     if symbol in a.reset_symbols:
         argv += ["--reset"] + (["--reset-memory"] if a.reset_memory else [])
     return argv
@@ -563,6 +567,8 @@ def add_parsers(sub) -> None:
                         "如 --reset ETHUSDT(逗號分隔),不加值則全部重設")
     p.add_argument("--reset-memory", action="store_true", help="搭配 --reset:連 AI 的心得也一起清除")
     p.add_argument("--max-steps", type=int, default=0, help="問 AI 幾次後結束,0=持續執行")
+    p.add_argument("--dashboard", nargs="?", type=int, const=8765, default=None, metavar="PORT",
+                   help="順便開本機儀表板(預設 port 8765,瀏覽器開 http://localhost:8765);多組模擬盤只需一組加")
     p.add_argument("--news", action="store_true",
                    help="每天(UTC)搜尋一次可靠來源的新聞,整理成消息面摘要附給 AI(用每日檢討模型 + Google 搜尋,另計費;"
                         "回放無法取得當時新聞,不支援)")
