@@ -199,6 +199,8 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
     if warn:
         print(f"[futures] {warn}")
     agent.news_enabled = a.news
+    # 同一個交易對的其他帳戶(例如不同 --style)共用新聞:同一天只搜一次
+    agent.news_cache = os.path.join(os.path.dirname(path) or ".", f"news_{a.symbol}.json") if a.news else None
     if a.news:
         print("[futures] 每日新聞:每天(UTC)第一次決策時以 Google 搜尋可靠來源整理消息面,附給 AI 參考(使用每日檢討模型)")
         if agent.news:
@@ -537,7 +539,8 @@ def _fmt_news(n: dict) -> str:
     """新聞摘要(日誌紀錄或 agent.news)給人看的文字;附上實際引用的網站供查核。"""
     if n.get("error"):
         return f"每日新聞({n['day']})搜尋失敗,稍後重試:{n['error']}"
-    lines = [f"每日新聞({n['day']},消息面{NEWS_SENTIMENT_NAMES.get(n['sentiment'], n['sentiment'])}):{n['summary']}"]
+    shared = "(與同交易對的其他帳戶共用,未另外呼叫)" if n.get("shared") else ""
+    lines = [f"每日新聞({n['day']},消息面{NEWS_SENTIMENT_NAMES.get(n['sentiment'], n['sentiment'])}){shared}:{n['summary']}"]
     lines += [f"    - {e['date']} {e['source']}:{e['event']}" for e in n.get("events") or []]
     sites = sorted({(s["title"], bool(s.get("reputable"))) for s in n.get("sources") or [] if s.get("title")},
                    key=lambda x: (not x[1], x[0]))

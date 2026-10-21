@@ -86,6 +86,16 @@ def old_lessons(path: str, a) -> Tuple[list, str]:
         return [], ""
 
 
+def wait_lock(path: str, timeout: float, poll: float = 1.0):
+    """等待取得獨占鎖(最多 timeout 秒);逾時回 False,不支援檔案鎖的平台回 None。"""
+    end = time.monotonic() + timeout
+    while True:
+        fh = try_lock(path)
+        if fh is not False or time.monotonic() >= end:
+            return fh
+        time.sleep(poll)
+
+
 def try_lock(path: str):
     """和 acquire_lock 相同,但已被占用時回 False(而不是丟例外);不支援檔案鎖的平台回 None。"""
     try:

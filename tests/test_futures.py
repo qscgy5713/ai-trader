@@ -872,6 +872,49 @@ class NewsTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("--news", err.getvalue())
 
+    def test_news_shared_between_accounts_of_same_symbol(self):
+        with tempfile.TemporaryDirectory() as t:
+            cache = os.path.join(t, "news_SOLUSDT.json")
+            m1, m2 = NewsModel(), NewsModel()
+            a, b = (FuturesAgent(acct(), FuturesRiskConfig()) for _ in range(2))
+            for x in (a, b):
+                x.news_enabled, x.news_cache = True, cache
+            a.decide(m1, "SOLUSDT", "1h", candles(), 100, TS)
+            rb = b.decide(m2, "SOLUSDT", "1h", candles(), 100, TS + 30)["news"]
+            self.assertEqual((len(m1.news_calls), len(m2.news_calls)), (1, 0))  # 第二個帳戶不再呼叫
+            self.assertTrue(rb["shared"])
+            self.assertIsNone(rb["meta"])  # 沒花錢
+            self.assertEqual(b.news, a.news)
+            self.assertIn("market_news", m2.calls[-1])
+            # 隔天:共用檔是前一天的,不能用,要重新搜
+            b.decide(m2, "SOLUSDT", "1h", candles(), 100, TS + 86400)
+            self.assertEqual(len(m2.news_calls), 1)
+            # 搜尋失敗不寫入共用檔,其他帳戶要自己搜
+            c = FuturesAgent(acct(), FuturesRiskConfig())
+            c.news_enabled, c.news_cache = True, os.path.join(t, "news_ETHUSDT.json")
+            c.decide(NewsModel(news_errors=[LLMError("x")]), "ETHUSDT", "1h", candles(), 100, TS)
+            self.assertFalse(os.path.exists(c.news_cache))
+
+    def test_news_waits_for_other_account_searching(self):
+        from aitrader.state import acquire_lock, save_json
+        import threading
+        with tempfile.TemporaryDirectory() as t:
+            cache = os.path.join(t, "news_SOLUSDT.json")
+            lock = acquire_lock(cache)  # 另一個帳戶正在搜尋
+            a = FuturesAgent(acct(), FuturesRiskConfig())
+            a.news_enabled, a.news_cache = True, cache
+            a._new_day(TS, 100)
+            news = {"day": a.day, "ts": TS, "summary": "別人搜的", "sentiment": "NEUTRAL", "events": [],
+                    "sources": [{"title": "coindesk.com", "uri": "u", "reputable": True}]}
+
+            def finish():  # 1 秒後對方搜完、寫入並釋放鎖
+                save_json(cache, {"symbol": "SOLUSDT", "news": news})
+                lock.close()
+            threading.Timer(1.0, finish).start()
+            m = NewsModel()
+            r = a.refresh_news(m, "SOLUSDT", TS, None)
+            self.assertEqual((r["summary"], len(m.news_calls)), ("別人搜的", 0))
+
     def test_report_shows_news_and_tokens(self):
         from aitrader.futures_cli import report_futures
         m = NewsModel()

@@ -14,6 +14,7 @@ K 線收盤後問模型,決策再經信心門檻、槓桿上限、最小調整�
 from __future__ import annotations
 
 import bisect
+import os
 import time
 from dataclasses import asdict, dataclass
 from typing import List, Optional, Tuple
@@ -26,11 +27,12 @@ from .market import MIN_BARS, Candle, features
 from .memory import LearningMemory, daily_reflection
 from .prompt import (FUTURES_REFLECTION_SYSTEM, NEWS_SYSTEM, build_futures_prompt, build_news_prompt, futures_system,
                      is_reputable_source)
-from .state import append_jsonl
+from .state import append_jsonl, load_json, save_json, wait_lock
 
 NEWS_MAX_ATTEMPTS = 2  # 每日新聞每天最多嘗試幾輪(每輪在不同的決策時間;之後當天放棄,不影響交易)
 NEWS_TRIES_PER_ROUND = 3  # 每輪立即重試幾次:API 偶爾漏回引用來源(實測約 1/3),內容其實有搜尋過
 NEWS_MAX_AGE_SECS = 36 * 3600  # 新聞摘要超過這個時間就不再附給 AI
+NEWS_LOCK_WAIT = 240  # 同交易對的其他帳戶正在搜尋時,最多等它幾秒(之後自己搜)
 BANKRUPT_PCT = 1.0  # 權益低於初始資金此 % 視為爆倉,停止交易
 MIN_LEVERAGE = 0.1  # 額度限制後可開槓桿低於此值就不開倉
 
@@ -88,6 +90,7 @@ class FuturesAgent:
         self.news_enabled = False
         self.news: Optional[dict] = None  # 最近一次成功的新聞摘要
         self.news_attempt_day, self.news_attempts = "", 0
+        self.news_cache: Optional[str] = None  # 共用新聞檔:同交易對的多個帳戶(例如不同風格)一天只搜一次
 
     # ---- 狀態 ----
     def _new_day(self, ts: float, price: float) -> None:
@@ -297,6 +300,41 @@ class FuturesAgent:
             return None
         rec = {"kind": "futures_news", "ts": ts, "day": self.day, "summary": None, "sentiment": None, "events": None,
                "sources": None, "meta": None, "error": None}
+        if not self.news_cache:
+            return self._search_and_record(model, symbol, ts, journal, rec)
+        if self._adopt_shared_news(rec):
+            return self._finish_news(rec, journal)
+        lock = wait_lock(self.news_cache, NEWS_LOCK_WAIT)  # 另一個帳戶正在搜:等它搜完直接用
+        try:
+            if self._adopt_shared_news(rec):
+                return self._finish_news(rec, journal)
+            out = self._search_and_record(model, symbol, ts, journal, rec)
+            if self.news and self.news["day"] == self.day and not rec["error"]:
+                save_json(self.news_cache, {"symbol": symbol, "news": self.news})
+            return out
+        finally:
+            if lock:
+                lock.close()
+
+    def _adopt_shared_news(self, rec: dict) -> bool:
+        """共用新聞檔裡已有今天的新聞就直接採用(不呼叫 API)。"""
+        try:
+            n = load_json(self.news_cache).get("news") if os.path.exists(self.news_cache) else None
+        except (ValueError, OSError):
+            return False
+        if not (isinstance(n, dict) and n.get("day") == self.day and n.get("sources")):
+            return False
+        self.news = dict(n)
+        rec.update(summary=n["summary"], sentiment=n["sentiment"], events=n["events"], sources=n["sources"], shared=True)
+        return True
+
+    @staticmethod
+    def _finish_news(rec: dict, journal: Optional[str]) -> dict:
+        if journal:
+            append_jsonl(journal, rec)
+        return rec
+
+    def _search_and_record(self, model, symbol: str, ts: float, journal: Optional[str], rec: dict) -> dict:
         try:
             brief, meta, sources = self._search_news(model, symbol, ts, rec)
             events = [asdict(e) for e in brief.events]
@@ -308,9 +346,7 @@ class FuturesAgent:
         except (LLMError, LLMConfigError) as e:  # 新聞只是輔助:連設定錯誤(例如模型不支援搜尋)也不停止交易
             self.news_attempts = NEWS_MAX_ATTEMPTS if isinstance(e, LLMConfigError) else self.news_attempts + 1
             rec["error"] = str(e)
-        if journal:
-            append_jsonl(journal, rec)
-        return rec
+        return self._finish_news(rec, journal)
 
     @staticmethod
     def _search_news(model, symbol: str, ts: float, rec: dict):
