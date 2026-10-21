@@ -361,13 +361,21 @@ const label=a=>a.symbol.replace("USDT","")+" · "+a.style+(a.learn?"":" · 無�
 const color=i=>COLORS[i%COLORS.length];
 const fmtp=v=>v==null?"-":(v>=100?v.toFixed(2):v>=1?v.toFixed(3):v.toFixed(4));
 
+// 合計:執行中的帳戶為主;另列「含已停止」(例如停掉的 ETH 的已實現 / 凍結損益)。
+// 已停止且從未成交的帳戶(早期測試留下的)不算,否則本金會稀釋報酬率。
+const counted=a=>!(a.running===false&&!a.trade_count);
+function sumUp(list){const init=list.reduce((x,a)=>x+a.initial,0),eq=list.reduce((x,a)=>x+a.equity,0);return{init,pnl:eq-init,r:init?(eq/init-1)*100:0,n:list.length}}
 function totals(){
   const box=document.getElementById("totals");box.replaceChildren();
-  const groups={};for(const a of D.accounts){(groups[a.style]=groups[a.style]||[]).push(a)}
-  for(const[s,list]of Object.entries(groups)){
-    const init=list.reduce((x,a)=>x+a.initial,0),eq=list.reduce((x,a)=>x+a.equity,0),r=(eq/init-1)*100;
-    box.append(el("div",{class:"panel"},el("div",{class:"muted"},s+" 合計("+list.length+" 個帳戶)"),
-      el("div",{class:"big "+cls(r)},unit==="pct"?pct(r):smoney(eq-init)),el("div",{class:"muted"},(unit==="pct"?smoney(eq-init):pct(r))+" · 本金 "+money(init))));
+  const styles=[...new Set(RAW.accounts.map(a=>a.style))];
+  for(const s of styles){
+    const all=RAW.accounts.filter(a=>a.style===s&&counted(a)),run=all.filter(a=>a.running!==false);
+    const R=sumUp(run.length?run:all),A=sumUp(all),main=unit==="pct"?pct(R.r):smoney(R.pnl);
+    const p=el("div",{class:"panel"},el("div",{class:"muted"},s+" 合計 · 執行中 "+R.n+" 個帳戶"),
+      el("div",{class:"big "+cls(R.r)},main),el("div",{class:"muted"},(unit==="pct"?smoney(R.pnl):pct(R.r))+" · 本金 "+money(R.init)));
+    if(A.n>R.n)p.append(el("div",{class:"muted",style:"margin-top:4px"},"含已停止("+A.n+" 個帳戶):",
+      el("span",{class:cls(A.pnl)},smoney(A.pnl)+"("+pct(A.r)+")"),",本金 "+money(A.init)));
+    box.append(p);
   }
 }
 function cards(){
