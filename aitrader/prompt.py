@@ -92,8 +92,10 @@ Task: write a short summary of the day, and return an UPDATED full list of at mo
 Respond with JSON only."""
 
 
-def build_reflection_prompt(symbol: str, review: dict, lessons: list) -> str:
+def build_reflection_prompt(symbol: str, review: dict, lessons: list, previous_days: Optional[list] = None) -> str:
     payload = {"symbol": symbol, "day_review": review, "current_lessons": lessons}
+    if previous_days:  # 只有 v2 檢討提示詞會給(v1 與先前逐字相同)
+        payload["previous_days"] = previous_days
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -243,3 +245,42 @@ Task: write a short summary of the day, and return an UPDATED full list of at mo
   program, not by your decisions; do not take credit for them, though you may note that the rule helped.
 - Only rely on the data provided. Write in Traditional Chinese.
 Respond with JSON only."""
+
+# v2:心得要是「條件 → 動作」且附證據次數;不寫程式強制執行的機制與空泛原則;摘要必須指出可改進的決策;
+# 並附上前幾天的檢討資料(previous_days),讓模型確認模式是否重複出現。用 --reflect-prompt v2 啟用,方便與 v1 對照
+FUTURES_REFLECTION_SYSTEM_V2 = """You review yesterday's decisions of an AI-managed PERPETUAL FUTURES account (paper trading, long/short with leverage).
+You receive the day's results (equity change, fees + funding as % of equity, forced exits such as stop_loss / trailing_stop /
+daily_loss / liquidation) and every decision (LONG / SHORT with leverage, FLAT, HOLD; what actually happened; the position
+afterwards; and the outcome until the next decision: price change, equity change, forced exits), your current lessons, and,
+if present, `previous_days`: the same data for up to 3 earlier days, so you can check whether a pattern repeats.
+Task: write a short summary of the day, and return an UPDATED full list of at most 5 lessons that the decision model
+(which sees technical features, the position, funding, constraints and its recent decisions with outcomes) can apply directly.
+Lessons:
+- Each lesson is a rule "condition → action". The condition must be observable in the decision inputs: features (RSI, SMAs,
+  MACD, volume ratio, range position, ATR), the position (leverage, unrealized P&L, stop distance), funding, or recent outcomes
+  (e.g. "a trailing_stop exit in the last 3 decisions"). Use concrete thresholds where the data supports them.
+  Bad: "停利後避免盲目追高". Good (format only; derive your own thresholds from the data):
+  "追蹤停利出場後 3 根 K 線內,若 RSI>65 不同向再進場,等回測 SMA20 不破再進".
+- End each lesson with its evidence in the form (證據 N 次:對 W / 錯 L), counted over today and previous_days; keep and
+  update the counts of lessons you keep. A lesson with N=1 is allowed but is the first to be replaced; drop lessons the
+  evidence contradicts. Fewer, better lessons are preferred.
+- Do NOT write lessons about mechanisms the program enforces (hard stop-loss, trailing stop, daily loss limit, liquidation,
+  max leverage) or generic principles without a condition (e.g. "嚴格停損", "控制風險", "耐心續抱讓利潤奔跑", "低槓桿能控制回撤").
+  Lessons about the model's own choices around them (e.g. leverage given the stop distance, re-entry after an exit) are fine.
+Judging:
+- Judge the PROCESS, not just the outcome. A winning trade can still be a bad decision and a losing one a good decision.
+  Each outcome has `worst_equity_pct` / `best_equity_pct` (the worst and best equity during that interval) and, when holding a
+  position, `closest_to_stop_pct` (how close price came to the stop-loss); the day has `intraday_worst_equity_pct` and
+  `closest_to_stop_pct`. If a profit came after a deep adverse move or after nearly hitting the stop, call it LUCKY and do NOT
+  endorse its leverage, sizing or holding behavior; prefer a lesson about reducing that risk instead.
+- Every lesson must still hold if the same situation had turned out the other way. Do not write lessons that merely
+  restate what worked today.
+- Exits listed in forced_exits are executed automatically by the program, not by your decisions; do not take credit for them.
+- One day is a small sample: prefer patterns that repeat across previous_days; say so when evidence is weak.
+Summary:
+- Name at least one specific decision that could have been better (time, action, what would have been better and why),
+  or explain specifically why none could. Do not praise discipline in general terms.
+- Only rely on the data provided. Write in Traditional Chinese.
+Respond with JSON only."""
+
+FUTURES_REFLECTION_PROMPTS = {"v1": FUTURES_REFLECTION_SYSTEM, "v2": FUTURES_REFLECTION_SYSTEM_V2}

@@ -49,7 +49,7 @@ def _risk_cfg(a, money: Money) -> FuturesRiskConfig:
 
 def _new_agent(a, rc: FuturesRiskConfig, money: Money) -> FuturesAgent:
     return FuturesAgent(FuturesAccount(money.to_usdt(a.cash), a.fee, a.slippage_bps), rc, learn=not a.no_learn,
-                        style=a.style)
+                        style=a.style, reflect_prompt=a.reflect_prompt)
 
 
 def _default_name(a, prefix: str) -> str:
@@ -81,6 +81,7 @@ def _risk_line(a, rc: FuturesRiskConfig, money: Money) -> str:
         f"不利 {rc.alert_move_pct:g}%" if rc.alert_move_pct else "",
         f"走完到停損 {rc.alert_stop_progress_pct:g}%" if rc.alert_stop_progress_pct else "") if x) + ")" \
         if (rc.alert_move_pct or rc.alert_stop_progress_pct) else ""
+    style += ";檢討提示詞 v2" if getattr(a, "reflect_prompt", "v1") == "v2" else ""
     return (f"風格 {style}(信心門檻 {rc.min_confidence:g});槓桿上限 {rc.max_leverage:g} 倍{trail};單日虧損上限 {rc.daily_loss_limit_pct:g}%{amt}(先到為準);"
             f"每筆最多用掉剩餘額度 {rc.risk_per_trade_pct:g}%{alert}")
 
@@ -186,7 +187,7 @@ def _futures_loop(a, rc: FuturesRiskConfig, model, path: str, journal: str, stop
         d = load_json(path)
         if d.get("symbol") != a.symbol or d.get("interval") != a.interval or d.get("model") != a.model:
             raise ValueError(f"狀態檔 {path} 的交易對 / 週期 / 模型與這次不同;加 --reset 重新開始或用 --state 指定其他檔案")
-        agent = FuturesAgent.from_dict(d["agent"], rc, not a.no_learn, a.style)  # 風控、學習、風格以這次啟動為準
+        agent = FuturesAgent.from_dict(d["agent"], rc, not a.no_learn, a.style, a.reflect_prompt)  # 風控、學習、風格以這次啟動為準
         saved_ts = d.get("saved_ts")
         last_bar, next_funding = d.get("last_bar_ts", 0), d.get("next_funding_ts", 0)
         print(f"[futures] 接續 {path}")
@@ -520,6 +521,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--reflect-model", help="每日檢討用的 Gemini 模型(例如 gemini-3.1-pro-preview);"
                    "一天只呼叫一次,可用較強的模型而不多花太多錢。未指定時用 .env 的 GEMINI_REFLECT_MODEL,"
                    "再沒有就與決策同一個模型")
+    p.add_argument("--reflect-prompt", choices=["v1", "v2"], default="v1",
+                   help="每日檢討提示詞版本:v1 原版 / v2 心得須為「條件 → 動作」並附證據次數、不寫程式強制的機制,"
+                        "且附上前 3 天的資料比對跨天模式(預設 v1)")
     p.add_argument("--style", choices=["auto", "conservative", "balanced", "aggressive"], default="auto",
                    help="交易風格:auto 不指定、由 AI 自行判斷 / conservative 保守(趨勢明確才進場)/ balanced 平衡偏積極 /"
                         " aggressive 積極;只影響 AI 進場意願,風控不變(預設 auto)")

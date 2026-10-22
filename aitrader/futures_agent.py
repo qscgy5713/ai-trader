@@ -25,7 +25,7 @@ from .grid_agent import candle_path
 from .llm import FuturesDecision, LLMConfigError, LLMError
 from .market import MIN_BARS, Candle, features
 from .memory import LearningMemory, daily_reflection
-from .prompt import (FUTURES_REFLECTION_SYSTEM, NEWS_SYSTEM, build_futures_prompt, build_news_prompt, futures_system,
+from .prompt import (FUTURES_REFLECTION_PROMPTS, NEWS_SYSTEM, build_futures_prompt, build_news_prompt, futures_system,
                      is_reputable_source)
 from .state import append_jsonl, load_json, save_json, wait_lock
 
@@ -82,10 +82,14 @@ class FuturesRiskConfig:
 
 
 class FuturesAgent:
-    def __init__(self, acct: FuturesAccount, cfg: FuturesRiskConfig, learn: bool = True, style: str = "auto"):
+    def __init__(self, acct: FuturesAccount, cfg: FuturesRiskConfig, learn: bool = True, style: str = "auto",
+                 reflect_prompt: str = "v1"):
         cfg.validate()
+        if reflect_prompt not in FUTURES_REFLECTION_PROMPTS:
+            raise ValueError(f"reflect_prompt 只支援 {', '.join(FUTURES_REFLECTION_PROMPTS)}")
         self.acct, self.cfg = acct, cfg
         self.style, self.system = style, futures_system(style)  # 交易風格只影響提示詞,不影響風控
+        self.reflect_prompt = reflect_prompt  # 每日檢討提示詞版本(v2 另附前幾天資料)
         self.day, self.day_start_equity, self.trades_today = "", acct.wallet, 0
         self.halted_day = ""
         self.pos_stop_pct = cfg.stop_loss_pct  # 目前倉位的停損(錢包 %),開倉時依剩餘額度決定
@@ -292,8 +296,9 @@ class FuturesAgent:
         review = self.memory.review
         if review and self.news and self.news["day"] == review["day_utc"] and "market_news" not in review:
             review["market_news"] = {k: self.news[k] for k in ("summary", "sentiment", "events")}  # 檢討時一併參考當天消息面
-        rec["reflection"] = (daily_reflection(self.memory, model, FUTURES_REFLECTION_SYSTEM, symbol, ts, journal,
-                                              "futures_reflection") if self.learn else None)
+        rec["reflection"] = (daily_reflection(self.memory, model, FUTURES_REFLECTION_PROMPTS[self.reflect_prompt], symbol,
+                                              ts, journal, "futures_reflection", with_past=self.reflect_prompt == "v2")
+                             if self.learn else None)
         rec["news"] = self.refresh_news(model, symbol, ts, journal) if self.news_enabled else None
         if self.halted_day != self.day and eq0 <= self.day_floor():
             # 空手時也要檢查(例如同一天連續停損):否則開倉後觸發價已在有利側,會立刻被平倉、白付手續費
@@ -512,9 +517,10 @@ class FuturesAgent:
                 "last_decision_price": self.last_decision_price, "alert_armed": self.alert_armed}
 
     @classmethod
-    def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True, style: str = "auto") -> "FuturesAgent":
+    def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True, style: str = "auto",
+                  reflect_prompt: str = "v1") -> "FuturesAgent":
         try:
-            a = cls(FuturesAccount.from_dict(d["acct"]), cfg, learn, style)
+            a = cls(FuturesAccount.from_dict(d["acct"]), cfg, learn, style, reflect_prompt)
             a.day, a.day_start_equity = str(d["day"]), float(d["day_start_equity"])
             a.trades_today, a.halted_day = int(d["trades_today"]), str(d["halted_day"])
             # 舊版狀態檔沒有以下欄位

@@ -971,6 +971,29 @@ class ProcessReviewTest(unittest.TestCase):
         self.assertNotIn("closest_to_stop_pct", out)
         self.assertEqual(out["worst_equity_pct"], 0)
 
+    def test_reflect_prompt_v2_adds_previous_days(self):
+        from aitrader.prompt import FUTURES_REFLECTION_SYSTEM, FUTURES_REFLECTION_SYSTEM_V2
+        cs, day0 = candles(), TS - TS % 86400 + 3600
+        calls = {}
+        for ver in ("v1", "v2"):
+            a, m = FuturesAgent(acct(), FuturesRiskConfig(), reflect_prompt=ver), FuturesLearningTest.Learner(D("LONG", 1))
+            for i in range(4):  # 4 天:第 2~4 天各檢討一次前一天
+                a.decide(m, "X", "1h", cs, 100 + i, day0 + i * 86400)
+            calls[ver] = m.reflect_calls
+            b = FuturesAgent.from_dict(json.loads(json.dumps(a.to_dict())), FuturesRiskConfig(), reflect_prompt=ver)
+            self.assertEqual(len(b.memory.past_reviews), 3)  # 存檔後保留(兩版都記,切換版本時就有前幾天可看)
+        self.assertTrue(all(s == FUTURES_REFLECTION_SYSTEM for s, _ in calls["v1"]))
+        self.assertTrue(all("previous_days" not in p for _, p in calls["v1"]))  # v1 與先前相同
+        self.assertTrue(all(s == FUTURES_REFLECTION_SYSTEM_V2 for s, _ in calls["v2"]))
+        n = [len(json.loads(p).get("previous_days", [])) for _, p in calls["v2"]]
+        self.assertEqual(n, [0, 1, 2])
+        self.assertEqual(json.loads(calls["v2"][2][1])["previous_days"][-1]["day_utc"],
+                         json.loads(calls["v2"][1][1])["day_review"]["day_utc"])
+        for word in ("condition → action", "證據", "Do NOT write lessons about mechanisms", "LUCKY", "do not take credit"):
+            self.assertIn(word, FUTURES_REFLECTION_SYSTEM_V2)
+        with self.assertRaises(ValueError):
+            FuturesAgent(acct(), FuturesRiskConfig(), reflect_prompt="v9")
+
     def test_reflection_prompts_judge_process(self):
         from aitrader.prompt import FUTURES_REFLECTION_SYSTEM, REFLECTION_SYSTEM
         for s in (FUTURES_REFLECTION_SYSTEM, REFLECTION_SYSTEM):

@@ -20,6 +20,7 @@ from .state import append_jsonl, load_json
 HISTORY_LEN = 8  # 決策時附上最近幾次的結果
 MAX_DAY_LOG = 48  # 一天最多保留幾筆給檢討(防止短週期時提示詞過長)
 MAX_REVIEW_ATTEMPTS = 3  # 檢討呼叫失敗最多重試幾次(之後放棄這一天)
+PAST_DAYS = 3  # 保留最近幾天已檢討的資料(v2 檢討提示詞用來比對跨天的模式)
 
 
 def _utc(ts: float) -> str:
@@ -38,6 +39,7 @@ class LearningMemory:
         self.lessons_updated = ""  # 最近一次檢討的日期
         self.review: Optional[dict] = None  # 等待檢討的前一天資料
         self.review_attempts = 0
+        self.past_reviews: List[dict] = []  # 最近已檢討過的前幾天資料(舊 → 新)
         self.grid_fills = 0  # 累計成交筆數(網格掛單)
         self.day_fills0 = 0  # 當日開始時的 grid_fills
         self.day_events: List[str] = []
@@ -143,7 +145,7 @@ class LearningMemory:
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in ("history", "day_log", "pending", "lessons", "lessons_updated", "review",
                                               "review_attempts", "grid_fills", "day_fills0", "day_events",
-                                              "day_eq_lo", "day_stop_min")}
+                                              "day_eq_lo", "day_stop_min", "past_reviews")}
 
     @classmethod
     def from_dict(cls, d: Optional[dict], fill_label: Optional[str] = "grid_fills") -> "LearningMemory":
@@ -157,14 +159,16 @@ class LearningMemory:
             m.review_attempts, m.grid_fills, m.day_fills0 = int(d["review_attempts"]), int(d["grid_fills"]), int(d["day_fills0"])
             m.day_events = [str(x) for x in d["day_events"]]
             m.day_eq_lo, m.day_stop_min = d.get("day_eq_lo"), d.get("day_stop_min")  # 舊版沒有
+            m.past_reviews = [x for x in d.get("past_reviews") or [] if isinstance(x, dict)][-PAST_DAYS:]
         except (KeyError, TypeError, ValueError) as ex:
             raise ValueError(f"學習紀錄格式錯誤:{ex!r}") from ex
         return m
 
 
 def daily_reflection(memory: LearningMemory, model, system: str, symbol: str, ts: float,
-                     journal: Optional[str], kind: str) -> Optional[dict]:
+                     journal: Optional[str], kind: str, with_past: bool = False) -> Optional[dict]:
     """有待檢討的前一天資料時,請模型檢討並更新心得;回傳日誌紀錄(沒做則 None)。
+    with_past:一併附上前幾天已檢討的資料(previous_days)。
     失敗不影響交易,下次決策再試(最多 MAX_REVIEW_ATTEMPTS 次)。設定錯誤照常往上丟。"""
     review = memory.review
     if not (review and getattr(model, "can_reflect", False)):
@@ -172,8 +176,10 @@ def daily_reflection(memory: LearningMemory, model, system: str, symbol: str, ts
     rec = {"kind": kind, "ts": ts, "day": review["day_utc"], "summary": None, "lessons": None, "meta": None,
            "error": None}
     try:
-        r, meta = model.reflect(system, build_reflection_prompt(symbol, review, memory.lessons))
+        past = memory.past_reviews if with_past else None
+        r, meta = model.reflect(system, build_reflection_prompt(symbol, review, memory.lessons, past))
         memory.set_lessons(r.lessons, review["day_utc"])
+        memory.past_reviews = (memory.past_reviews + [review])[-PAST_DAYS:]
         rec.update(summary=r.summary, lessons=list(memory.lessons), meta=meta)
     except LLMConfigError:
         raise
