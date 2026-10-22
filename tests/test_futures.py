@@ -1030,6 +1030,19 @@ class UrgentCheckTest(unittest.TestCase):
         sp = short.acct.stop_price(short.pos_stop_pct)
         self.assertAlmostEqual(short.alert_price(), 100 + (sp - 100) / 2)  # 空單:往上走一半
 
+    def test_partial_reduction_keeps_stop_price(self):
+        """10-22 balanced SUI:減半後停損價被往下移(錢包 % 不變 → 價格距離加倍),後半部多跌一段才出場。"""
+        for side, px in (("LONG", 99.0), ("SHORT", 101.0)):
+            a = FuturesAgent(acct(), FuturesRiskConfig(max_leverage=2, alert_move_pct=0.5))
+            a.decide(SeqModel(D(side, 1)), "X", "1h", candles(), 100, TS)
+            stop0 = a.acct.stop_price(a.pos_stop_pct)
+            r = a.decide(SeqModel(D(side, 0.5)), "X", "1h", candles(), px, TS + 600, alert=1.0)
+            self.assertEqual(r["code"], "execute")
+            self.assertAlmostEqual(a.acct.stop_price(a.pos_stop_pct), stop0, places=6, msg=side)  # 停損價不變
+            self.assertLess(a.pos_stop_pct, 2.0)  # 部位小了,碰到停損時虧的錢包 % 也變小
+            a.decide(SeqModel(D(side, 1)), "X", "1h", candles(), 100, TS + 3600)  # 加回去:停損依當下額度重新計算
+            self.assertGreater(abs(a.acct.stop_price(a.pos_stop_pct) - 100), 0)
+
     def test_reduction_not_counted_toward_daily_trades(self):
         a = FuturesAgent(acct(), FuturesRiskConfig(max_trades_per_day=1, max_leverage=2))
         a.decide(SeqModel(D("LONG", 2)), "X", "1h", candles(), 100, TS)

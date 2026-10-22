@@ -329,6 +329,8 @@ class FuturesAgent:
             target, why, code = self._filter(decision, price)
         stop_pct = self.sizing(price)[0]
         reduce = target is not None and self._is_reduction(target, price)
+        # 部分減倉時停損「價格」不變:停損以錢包 % 計,若沿用 % 部位減半會讓停損價離兩倍遠,最大虧損反而沒有降低
+        keep_stop = self.acct.stop_price(self.pos_stop_pct) if reduce and target else None
         t = self.acct.rebalance(target, price, ts, why) if target is not None else None
         # 急跌檢查後要等下一次例行決策才會再觸發;但這次檢查沒拿到 AI 決策(逾時等)就保留,讓呼叫端稍後重試
         self.last_decision_price = price if (alert is None or rec["decision"] is not None) else self.last_decision_price
@@ -337,8 +339,11 @@ class FuturesAgent:
             if not reduce:  # 減倉 / 平倉是降低風險,不占每日交易次數
                 self.trades_today += 1
             self.trail_peak = None  # 倉位變了:追蹤停損重新計算
-            if target:
-                self.pos_stop_pct = stop_pct  # 新倉位的停損依開倉當下的剩餘額度
+            a = self.acct
+            if keep_stop is not None and abs(a.qty) > DUST and a.wallet > 0:
+                self.pos_stop_pct = max(0.0, (a.entry - keep_stop) * a.qty / a.wallet * 100)  # 換算回錢包 %,價格不變
+            elif target:
+                self.pos_stop_pct = stop_pct  # 新倉位 / 加倉的停損依當下的剩餘額度
         if rec["decision"] is not None:  # 模型失敗(稍後重試)不記,避免成績單被錯誤紀錄擠掉
             d = rec["decision"]
             side = self.position_info(price)
