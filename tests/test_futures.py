@@ -994,7 +994,8 @@ class UrgentCheckTest(unittest.TestCase):
         payload = json.loads(m.calls[-1])
         self.assertIn("urgent_check", payload["constraints"])
         self.assertIn("reduce part", payload["constraints"]["urgent_check"]["note"])
-        self.assertEqual(r["alert"], {"move_pct": 1.6, "from_price": 100})
+        self.assertEqual((r["alert"]["move_pct"], r["alert"]["from_price"]), (1.6, 100))
+        self.assertIn("stop-loss is at", payload["constraints"]["urgent_check"]["trigger"])
         self.assertEqual(r["code"], "execute")
         self.assertAlmostEqual(a.acct.exposure_pct(98.4), 50, delta=1)  # 減倉一半
         self.assertIsNone(a.alert_move(90))  # 急跌檢查後要等下一次例行決策才會再觸發
@@ -1006,6 +1007,28 @@ class UrgentCheckTest(unittest.TestCase):
         short = FuturesAgent(acct(), FuturesRiskConfig(alert_move_pct=1.5))
         short.decide(SeqModel(D("SHORT", 1)), "X", "1h", candles(), 100, TS)
         self.assertEqual(short.alert_move(102), 2.0)  # 空單:上漲是不利方向
+
+    def test_alert_before_close_stop_with_high_leverage(self):
+        """10-22 SUI:1.5 倍時停損只在約 1.6% 外,固定 1.5% 門檻(自每小時更新的決策價起算)永遠比停損晚 → 改看走完到停損的比例。"""
+        a = FuturesAgent(acct(), FuturesRiskConfig(alert_move_pct=1.5, alert_stop_progress_pct=50, max_leverage=3,
+                                                  stop_loss_pct=3, min_stop_distance_pct=0.5))
+        a.decide(SeqModel(D("LONG", 1.5)), "X", "1h", candles(), 100, TS)
+        a.decide(SeqModel(D("HOLD")), "X", "1h", candles(), 99.0, TS + 3600)  # 緩跌,例行決策價更新為 99
+        stop = a.acct.stop_price(a.pos_stop_pct)
+        self.assertGreater(stop, 99 * (1 - 0.015))  # 停損比「再跌 1.5%」還近
+        half = 99 - (99 - stop) / 2
+        self.assertIsNone(a.alert_move(half + 0.05))
+        self.assertIsNotNone(a.alert_move(half - 0.01))  # 走完一半就觸發,停損前還有時間
+        self.assertAlmostEqual(a.alert_price(), half)
+        b = FuturesAgent(acct(), FuturesRiskConfig(alert_move_pct=1.5, alert_stop_progress_pct=0, max_leverage=3,
+                                                  stop_loss_pct=3, min_stop_distance_pct=0.5))
+        b.decide(SeqModel(D("LONG", 1.5)), "X", "1h", candles(), 100, TS)
+        b.decide(SeqModel(D("HOLD")), "X", "1h", candles(), 99.0, TS + 3600)
+        self.assertIsNone(b.alert_move(half - 0.01))  # 只用固定 % 門檻(舊行為):這裡不會觸發
+        short = FuturesAgent(acct(), FuturesRiskConfig(alert_move_pct=0, alert_stop_progress_pct=50))
+        short.decide(SeqModel(D("SHORT", 1)), "X", "1h", candles(), 100, TS)
+        sp = short.acct.stop_price(short.pos_stop_pct)
+        self.assertAlmostEqual(short.alert_price(), 100 + (sp - 100) / 2)  # 空單:往上走一半
 
     def test_reduction_not_counted_toward_daily_trades(self):
         a = FuturesAgent(acct(), FuturesRiskConfig(max_trades_per_day=1, max_leverage=2))

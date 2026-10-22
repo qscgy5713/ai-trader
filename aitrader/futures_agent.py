@@ -51,6 +51,8 @@ class FuturesRiskConfig:
     trail_activate_pct: float = 2.0  # 持倉獲利達錢包此 % 啟動追蹤停損;0 = 不啟用
     trail_distance_pct: float = 1.5  # 從獲利高點回吐超過錢包此 % 就平倉(最低約保本,未計手續費)
     alert_move_pct: float = 1.5  # 有持倉時,價格自上次決策往不利方向走超過此 % 就立刻多問一次 AI;0 = 關閉
+    # 或已從上次決策價走完「到停損價距離」的此 %(槓桿高、停損近時,固定 % 門檻會比停損還遠而來不及觸發);0 = 不用
+    alert_stop_progress_pct: float = 50.0
 
     def validate(self) -> None:
         if not 0 < self.max_leverage <= 10:
@@ -75,6 +77,8 @@ class FuturesRiskConfig:
             raise ValueError("trail_activate 不可為負;trail_distance 需在 (0, 100)")
         if not 0 <= self.alert_move_pct < 50:
             raise ValueError("alert_move 需在 [0, 50)")
+        if not 0 <= self.alert_stop_progress_pct < 100:
+            raise ValueError("alert_stop_progress 需在 [0, 100)")
 
 
 class FuturesAgent:
@@ -247,20 +251,32 @@ class FuturesAgent:
         return rec
 
     # ---- 模型決策 ----
-    def alert_move(self, price: float) -> Optional[float]:
-        """價格自上次決策往持倉不利方向走了多少 %;達到 alert_move_pct 且這段期間還沒觸發過才回傳,否則 None。"""
-        a, lim, ref = self.acct, self.cfg.alert_move_pct, self.last_decision_price
-        if not (lim and self.alert_armed and ref) or abs(a.qty) < DUST:
-            return None
-        move = (ref - price) / ref * 100 if a.qty > 0 else (price - ref) / ref * 100
-        return round(move, 2) if move >= lim - 1e-9 else None
-
     def alert_price(self) -> Optional[float]:
-        """急跌檢查的觸發價(回放用:連續走勢穿越此價時檢查);不會觸發時回 None。"""
-        a, lim, ref = self.acct, self.cfg.alert_move_pct, self.last_decision_price
-        if not (lim and self.alert_armed and ref) or abs(a.qty) < DUST:
+        """急跌檢查的觸發價:自上次決策價不利變動 alert_move_pct%,或走完到停損價距離的 alert_stop_progress_pct%,
+        取先碰到的那個(多單取較高、空單取較低)。關閉、空手、這段期間已觸發過時回 None。"""
+        a, c, ref = self.acct, self.cfg, self.last_decision_price
+        if not ((c.alert_move_pct or c.alert_stop_progress_pct) and self.alert_armed and ref) or abs(a.qty) < DUST:
             return None
-        return ref * (1 - lim / 100) if a.qty > 0 else ref * (1 + lim / 100)
+        long = a.qty > 0
+        cands = []
+        if c.alert_move_pct:
+            cands.append(ref * (1 - c.alert_move_pct / 100) if long else ref * (1 + c.alert_move_pct / 100))
+        stop = a.stop_price(self.pos_stop_pct)
+        if c.alert_stop_progress_pct and stop and (ref > stop if long else ref < stop):
+            cands.append(ref - (ref - stop) * c.alert_stop_progress_pct / 100)
+        if not cands:
+            return None
+        return max(cands) if long else min(cands)
+
+    def alert_move(self, price: float) -> Optional[float]:
+        """到達急跌檢查觸發價時,回傳自上次決策價的不利變動 %;否則 None。"""
+        ap, ref = self.alert_price(), self.last_decision_price
+        if ap is None:
+            return None
+        long = self.acct.qty > 0
+        if not (price <= ap * (1 + 1e-9) if long else price >= ap * (1 - 1e-9)):
+            return None
+        return round((ref - price) / ref * 100 if long else (price - ref) / ref * 100, 2)
 
     def decide(self, model, symbol: str, interval: str, candles: List[Candle], price: float, ts: float,
                funding_rate: Optional[float] = None, journal: Optional[str] = None,
@@ -271,7 +287,8 @@ class FuturesAgent:
         self.memory.settle(ts, price, eq0)
         rec = self._rec(price, ts, getattr(model, "name", "?"))
         if alert is not None:
-            rec["alert"] = {"move_pct": alert, "from_price": self.last_decision_price}
+            stop = self.acct.stop_price(self.pos_stop_pct)
+            rec["alert"] = {"move_pct": alert, "from_price": self.last_decision_price, "stop_price": stop}
         review = self.memory.review
         if review and self.news and self.news["day"] == review["day_utc"] and "market_news" not in review:
             review["market_news"] = {k: self.news[k] for k in ("summary", "sentiment", "events")}  # 檢討時一併參考當天消息面
@@ -289,9 +306,11 @@ class FuturesAgent:
             feats = features(candles)
             cons = self._constraints(price)
             if alert is not None:
+                stop = rec["alert"]["stop_price"]
                 cons["urgent_check"] = {
                     "trigger": f"price moved {alert:.2f}% against the position since the last decision "
-                               f"({self.last_decision_price:g} -> {price:g})",
+                               f"({self.last_decision_price:g} -> {price:g})"
+                               + (f"; the stop-loss is at {stop:g}, {abs(price - stop) / price * 100:.2f}% away" if stop else ""),
                     "note": "This is an extra check outside the regular schedule. You may reduce part of the position "
                             "(same direction with a lower leverage, e.g. half), close it (FLAT), keep it (HOLD) or reverse. "
                             "A partial reduction can be added back at a later regular decision if conditions recover. "
