@@ -27,6 +27,7 @@ from .market import MIN_BARS, Candle, features
 from .memory import LearningMemory, daily_reflection
 from .prompt import (FUTURES_REFLECTION_PROMPTS, NEWS_SYSTEM, build_futures_prompt, build_news_prompt, futures_system,
                      is_reputable_source)
+from .runtime import INTERVAL_SECS
 from .state import append_jsonl, load_json, save_json, wait_lock
 
 NEWS_MAX_ATTEMPTS = 2  # 每日新聞每天最多嘗試幾輪(每輪在不同的決策時間;之後當天放棄,不影響交易)
@@ -53,6 +54,8 @@ class FuturesRiskConfig:
     alert_move_pct: float = 1.5  # 有持倉時,價格自上次決策往不利方向走超過此 % 就立刻多問一次 AI;0 = 關閉
     # 或已從上次決策價走完「到停損價距離」的此 %(槓桿高、停損近時,固定 % 門檻會比停損還遠而來不及觸發);0 = 不用
     alert_stop_progress_pct: float = 50.0
+    # 平倉(含停損、追蹤停利、反手的舊倉)後,這麼多根 K 線內不開新倉 / 不反手(震盪盤中來回進出是主要虧損來源);0 = 關閉
+    reentry_cooldown_bars: int = 0  # CLI 預設 3
 
     def validate(self) -> None:
         if not 0 < self.max_leverage <= 10:
@@ -79,6 +82,8 @@ class FuturesRiskConfig:
             raise ValueError("alert_move 需在 [0, 50)")
         if not 0 <= self.alert_stop_progress_pct < 100:
             raise ValueError("alert_stop_progress 需在 [0, 100)")
+        if not 0 <= self.reentry_cooldown_bars <= 48:
+            raise ValueError("reentry_cooldown 需在 [0, 48]")
 
 
 class FuturesAgent:
@@ -105,6 +110,7 @@ class FuturesAgent:
         # 急跌檢查:上次決策時的價格;每次例行決策後可觸發一次(避免來回震盪時重複呼叫)
         self.last_decision_price: Optional[float] = None
         self.alert_armed = True
+        self.last_exit_ts: Optional[float] = None  # 最近一次倉位結束(平倉 / 反手)的時間,冷卻期由此起算
 
     # ---- 狀態 ----
     def _new_day(self, ts: float, price: float) -> None:
@@ -240,6 +246,7 @@ class FuturesAgent:
                 self.halted_day = self.day
             t = a.rebalance(0, px, ts, why)  # 原因寫中文,畫面「最近成交」直接顯示
         self.trail_peak = None
+        self.last_exit_ts = ts
         self.memory.on_tick(0, code)
         rec.update(forced=True, action_taken=why, code=code, trade=asdict(t) if t else None)
         return self._finish(rec, price, journal)
@@ -309,7 +316,14 @@ class FuturesAgent:
             why, code, target = "今日已觸發強平或單日虧損上限,停止交易至明天(UTC)", "halted", None
         else:
             feats = features(candles)
+            blocked = self.cooldown_until(ts, interval)
             cons = self._constraints(price)
+            if blocked is not None:
+                cons["reentry_cooldown"] = (
+                    f"A position was closed at {time.strftime('%H:%M', time.gmtime(self.last_exit_ts))} UTC. Until "
+                    f"{time.strftime('%H:%M', time.gmtime(blocked))} UTC the program blocks opening a new position or "
+                    "reversing (a reversal is executed as FLAT only). HOLD, FLAT, reducing or adding to an existing "
+                    "position are allowed.")
             if alert is not None:
                 stop = rec["alert"]["stop_price"]
                 cons["urgent_check"] = {
@@ -317,7 +331,8 @@ class FuturesAgent:
                                f"({self.last_decision_price:g} -> {price:g})"
                                + (f"; the stop-loss is at {stop:g}, {abs(price - stop) / price * 100:.2f}% away" if stop else ""),
                     "note": "This is an extra check outside the regular schedule. You may reduce part of the position "
-                            "(same direction with a lower leverage, e.g. half), close it (FLAT), keep it (HOLD) or reverse. "
+                            "(same direction with a lower leverage, e.g. half), close it (FLAT), keep it (HOLD)"
+                            + (". " if blocked is not None else " or reverse. ") +
                             "A partial reduction can be added back at a later regular decision if conditions recover. "
                             "Reducing a position does not use up trades_left_today."}
             prompt = build_futures_prompt(symbol, interval, feats, self.position_info(price), funding_rate,
@@ -331,12 +346,15 @@ class FuturesAgent:
                 raise
             except LLMError as e:
                 rec["error"] = str(e)
-            target, why, code = self._filter(decision, price)
+            target, why, code = self._filter(decision, price, blocked)
         stop_pct = self.sizing(price)[0]
         reduce = target is not None and self._is_reduction(target, price)
         # 部分減倉時停損「價格」不變:停損以錢包 % 計,若沿用 % 部位減半會讓停損價離兩倍遠,最大虧損反而沒有降低
         keep_stop = self.acct.stop_price(self.pos_stop_pct) if reduce and target else None
+        side0 = self.acct.qty
         t = self.acct.rebalance(target, price, ts, why) if target is not None else None
+        if t and abs(side0) > DUST and (abs(self.acct.qty) < DUST or (self.acct.qty > 0) != (side0 > 0)):
+            self.last_exit_ts = ts  # 平倉或反手:舊倉位結束
         # 急跌檢查後要等下一次例行決策才會再觸發;但這次檢查沒拿到 AI 決策(逾時等)就保留,讓呼叫端稍後重試
         self.last_decision_price = price if (alert is None or rec["decision"] is not None) else self.last_decision_price
         self.alert_armed = alert is None or rec["decision"] is None
@@ -457,7 +475,18 @@ class FuturesAgent:
                 if self.acct.equity(price) > 0 else 0.0,
                 "trades_left_today": max(0, c.max_trades_per_day - self.trades_today)}
 
-    def _filter(self, d: Optional[FuturesDecision], price: float) -> Tuple[Optional[float], str, str]:
+    def cooldown_until(self, ts: float, interval: str) -> Optional[float]:
+        """平倉後的冷卻期:還在冷卻中時回傳可再開倉的時間(K 線邊界),否則 None。
+        以 K 線編號計算,不受整點決策的幾秒誤差影響:例如 1h、3 根,09:00 平倉 → 12:00 起才能開倉。"""
+        n = self.cfg.reentry_cooldown_bars
+        if not n or self.last_exit_ts is None:
+            return None
+        secs = INTERVAL_SECS.get(interval, 3600)
+        until = (self.last_exit_ts // secs + n) * secs
+        return until if ts < until else None
+
+    def _filter(self, d: Optional[FuturesDecision], price: float,
+                blocked_until: Optional[float] = None) -> Tuple[Optional[float], str, str]:
         c = self.cfg
         if d is None:
             return None, "模型無有效決策,不交易", "no_decision"
@@ -472,6 +501,12 @@ class FuturesAgent:
             target = lev * 100 * (1 if d.action == "LONG" else -1)
         if d.action == "FLAT" and abs(self.acct.qty) < DUST:
             return None, "已是空手", "noop"
+        new_entry = d.action != "FLAT" and (cur == 0 or (target > 0) != (cur > 0))  # 空手開倉或反手
+        if new_entry and blocked_until is not None:
+            until = time.strftime("%H:%M", time.localtime(blocked_until))
+            if cur == 0:
+                return None, f"平倉後冷卻中({until} 前不開新倉)", "cooldown"
+            d, target = FuturesDecision("FLAT", 0.0, d.confidence, d.reason), 0.0  # 反手:只平倉,冷卻後再決定
         if d.action != "FLAT" and cap < MIN_LEVERAGE and not self._is_reduction(target, price):  # 減倉照樣放行
             return None, "今日剩餘虧損額度不足,不開新倉", "budget_exhausted"
         if d.confidence < c.min_confidence:
@@ -486,6 +521,8 @@ class FuturesAgent:
             note = (f"(槓桿上限 {c.max_leverage:g} 倍)" if cap >= c.max_leverage
                     else f"(依今日剩餘額度,上限 {cap:.2f} 倍)")
         label = {"LONG": "做多", "SHORT": "做空", "FLAT": "平倉"}[d.action]
+        if new_entry and blocked_until is not None:
+            note = "(冷卻中不反手,只平倉)"
         return target, f"執行 {label} {abs(target) / 100:.2f} 倍{note}", "execute"
 
     def _is_reduction(self, target: float, price: float) -> bool:
@@ -514,7 +551,8 @@ class FuturesAgent:
                 "trail_peak": self.trail_peak,
                 "day_start_costs": self.day_start_costs, "memory": self.memory.to_dict(),
                 "news": self.news, "news_attempt_day": self.news_attempt_day, "news_attempts": self.news_attempts,
-                "last_decision_price": self.last_decision_price, "alert_armed": self.alert_armed}
+                "last_decision_price": self.last_decision_price, "alert_armed": self.alert_armed,
+                "last_exit_ts": self.last_exit_ts}
 
     @classmethod
     def from_dict(cls, d: dict, cfg: FuturesRiskConfig, learn: bool = True, style: str = "auto",
@@ -532,6 +570,7 @@ class FuturesAgent:
             a.news_attempt_day, a.news_attempts = str(d.get("news_attempt_day", "")), int(d.get("news_attempts", 0))
             ldp = d.get("last_decision_price")
             a.last_decision_price, a.alert_armed = (None if ldp is None else float(ldp)), bool(d.get("alert_armed", True))
+            a.last_exit_ts = None if d.get("last_exit_ts") is None else float(d["last_exit_ts"])
         except (KeyError, TypeError, ValueError) as e:
             raise ValueError(f"合約狀態檔格式錯誤:{e!r}") from e
         return a

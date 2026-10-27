@@ -42,7 +42,8 @@ def _risk_cfg(a, money: Money) -> FuturesRiskConfig:
     min_conf = a.min_confidence if a.min_confidence is not None else STYLE_MIN_CONFIDENCE[a.style]
     c = FuturesRiskConfig(a.max_leverage, min_conf, a.min_change, a.stop_loss, a.daily_loss_limit,
                           a.max_trades, money.to_usdt(a.daily_loss_amount), a.risk_per_trade, a.min_stop_distance,
-                          a.trail_activate, a.trail_distance, a.alert_move, a.alert_stop_progress)
+                          a.trail_activate, a.trail_distance, a.alert_move, a.alert_stop_progress,
+                          a.reentry_cooldown)
     c.validate()
     return c
 
@@ -82,8 +83,9 @@ def _risk_line(a, rc: FuturesRiskConfig, money: Money) -> str:
         f"走完到停損 {rc.alert_stop_progress_pct:g}%" if rc.alert_stop_progress_pct else "") if x) + ")" \
         if (rc.alert_move_pct or rc.alert_stop_progress_pct) else ""
     style += ";檢討提示詞 v2" if getattr(a, "reflect_prompt", "v1") == "v2" else ""
+    cool = f";平倉後 {rc.reentry_cooldown_bars} 根 K 線內不開新倉" if rc.reentry_cooldown_bars else ""
     return (f"風格 {style}(信心門檻 {rc.min_confidence:g});槓桿上限 {rc.max_leverage:g} 倍{trail};單日虧損上限 {rc.daily_loss_limit_pct:g}%{amt}(先到為準);"
-            f"每筆最多用掉剩餘額度 {rc.risk_per_trade_pct:g}%{alert}")
+            f"每筆最多用掉剩餘額度 {rc.risk_per_trade_pct:g}%{alert}{cool}")
 
 
 def _hm(ts: float) -> str:
@@ -439,7 +441,7 @@ def _futures_replay_one(a):
 CODE_NAMES = {"execute": "執行", "hold": "維持", "noop": "已在目標", "low_confidence": "信心不足",
               "max_trades": "達每日交易上限", "halted": "停機中", "bankrupt": "爆倉", "no_decision": "無有效決策",
               "stop_loss": "停損", "daily_loss": "單日虧損上限", "liquidation": "強平",
-              "budget_exhausted": "今日額度不足", "trailing_stop": "追蹤停損"}
+              "budget_exhausted": "今日額度不足", "trailing_stop": "追蹤停損", "cooldown": "平倉後冷卻"}
 
 
 def _print_downtime(recs: List[dict], kind: str) -> None:
@@ -555,6 +557,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     g.add_argument("--alert-stop-progress", type=float, default=50,
                    help="急跌檢查另一個條件:價格已從上次決策價走完到停損價距離的此 %%(槓桿高、停損近時固定 %% 門檻會來不及);"
                         "0=不用(預設 50)")
+    g.add_argument("--reentry-cooldown", type=int, default=3,
+                   help="平倉(含停損、追蹤停利、反手)後這麼多根 K 線內不開新倉、不反手(反手只平倉);"
+                        "震盪盤中避免來回進出。0=關閉(預設 3)")
     g.add_argument("--min-stop-distance", type=float, default=0.5,
                    help="停損距離(價格 %%)下限,用來決定可開槓桿上限(預設 0.5)")
     p.add_argument("--no-learn", action="store_true",

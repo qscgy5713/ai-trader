@@ -1002,6 +1002,47 @@ class ProcessReviewTest(unittest.TestCase):
             self.assertIn("do not take credit", s)
 
 
+class ReentryCooldownTest(unittest.TestCase):
+    """平倉後 N 根 K 線內不開新倉、不反手(震盪盤中來回進出是主要虧損來源)。"""
+
+    def test_cooldown_after_close(self):
+        cfg, cs, h = FuturesRiskConfig(reentry_cooldown_bars=3), candles(), TS - TS % 3600 + 5  # 整點過 5 秒決策
+        a = FuturesAgent(acct(), cfg)
+        m = SeqModel(D("LONG", 1), D("FLAT"), D("SHORT", 1), D("LONG", 1), D("SHORT", 1))
+        a.decide(m, "X", "1h", cs, 100, h)
+        self.assertEqual(a.decide(m, "X", "1h", cs, 100, h + 3600)["code"], "execute")  # 平倉
+        r = a.decide(m, "X", "1h", cs, 100, h + 2 * 3600)
+        self.assertEqual(r["code"], "cooldown")  # 平倉後第 1 根:不開新倉
+        self.assertIn("reentry_cooldown", m.calls[-1])  # 提示詞告知 AI
+        self.assertEqual(a.decide(m, "X", "1h", cs, 100, h + 3 * 3600)["code"], "cooldown")
+        self.assertEqual(a.decide(m, "X", "1h", cs, 100, h + 4 * 3600 - 6)["code"], "cooldown")  # 以 K 線編號計,不看秒差
+        b, m2 = FuturesAgent.from_dict(json.loads(json.dumps(a.to_dict())), cfg), SeqModel(D("SHORT", 1))  # 存檔後照常
+        self.assertEqual(b.decide(m2, "X", "1h", cs, 100, h + 4 * 3600)["code"], "execute")  # 第 3 根起可以開倉
+        self.assertNotIn("reentry_cooldown", m2.calls[-1])
+
+    def test_flip_becomes_flat_and_forced_exit_starts_cooldown(self):
+        cfg, cs, h = FuturesRiskConfig(reentry_cooldown_bars=2), candles(), TS - TS % 3600 + 5
+        a = FuturesAgent(acct(), cfg)
+        a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, h)
+        a.check(a.acct.stop_price(a.pos_stop_pct) - 0.01, h + 600)  # 停損也算平倉
+        self.assertEqual(a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, h + 3600)["code"], "cooldown")
+        a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, h + 2 * 3600)  # 冷卻結束:開倉
+        r = a.decide(SeqModel(D("LONG", 1.5)), "X", "1h", cs, 100, h + 3 * 3600)  # 同方向加倉不受限
+        self.assertEqual((r["code"], round(a.acct.exposure_pct(100))), ("execute", 150))
+        r = a.decide(SeqModel(D("SHORT", 1)), "X", "1h", cs, 100, h + 4 * 3600)  # 反手(沒有冷卻):照做,舊倉結束
+        self.assertLess(a.acct.qty, 0)
+        a.decide(SeqModel(D("SHORT", 1)), "X", "1h", cs, 100, h + 4 * 3600 + 60)
+        trades = a.trades_today
+        r = a.decide(SeqModel(D("LONG", 1)), "X", "1h", cs, 100, h + 5 * 3600)  # 反手後冷卻中再反手:只平倉
+        self.assertEqual(r["code"], "execute")
+        self.assertIn("只平倉", r["action_taken"])
+        self.assertAlmostEqual(a.acct.qty, 0)
+        self.assertEqual(a.trades_today, trades)  # 平倉不占交易次數
+        self.assertEqual(FuturesAgent(acct(), FuturesRiskConfig()).cooldown_until(h, "1h"), None)  # 預設關閉
+        with self.assertRaises(ValueError):
+            FuturesRiskConfig(reentry_cooldown_bars=-1).validate()
+
+
 class UrgentCheckTest(unittest.TestCase):
     """急跌檢查:持倉往不利方向走超過門檻時,不等整點立刻多問一次 AI;可部分減倉,減倉不占交易次數。"""
 
