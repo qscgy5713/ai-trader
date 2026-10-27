@@ -438,6 +438,8 @@ def _futures_replay_one(a):
 
 # ------------------------------ report ------------------------------
 
+MAX_ALERT_BARS = 30 * 1440  # report --alerts 最多抓 30 天的 1 分鐘 K 線(約 30 次請求)
+
 CODE_NAMES = {"execute": "執行", "hold": "維持", "noop": "已在目標", "low_confidence": "信心不足",
               "max_trades": "達每日交易上限", "halted": "停機中", "bankrupt": "爆倉", "no_decision": "無有效決策",
               "stop_loss": "停損", "daily_loss": "單日虧損上限", "liquidation": "強平",
@@ -449,6 +451,35 @@ def _print_downtime(recs: List[dict], kind: str) -> None:
     if down:
         total = sum(r["seconds"] for r in down)
         print(f"⚠ 程式中斷 {len(down)} 次,共 {fmt_hours(total)}(電腦睡眠或程式未執行):期間沒有檢查停損、沒有問 AI,成績可能失真")
+
+
+def report_alerts(a) -> int:
+    """report --alerts:急跌檢查成效(見 alert_review.py)。可一次給多個合約日誌,同交易對共用 K 線。"""
+    from .alert_review import bars_needed, print_review, review, symbol_of
+    from .cli import _load_journal
+    if a.symbol and len(a.journal) > 1:
+        raise ValueError("--symbol 只能搭配一個日誌")
+    now, jobs = time.time(), []
+    for path in a.journal:
+        recs = _load_journal(path)
+        if not any(r.get("kind") == "futures" for r in recs):
+            raise ValueError(f"{path} 不是合約日誌")
+        sym = a.symbol.upper() if a.symbol else symbol_of(path)
+        if not sym:
+            raise ValueError(f"看不出 {path} 的交易對,請加 --symbol")
+        jobs.append((path, sym, recs))
+    bars, groups, open_n = {}, {}, 0
+    for path, sym, recs in jobs:
+        if sym not in bars:
+            n = bars_needed([r for _, s2, r in jobs if s2 == sym], now)
+            if n > MAX_ALERT_BARS:
+                print(f"⚠ {sym} 需要 {n} 根 1 分鐘 K 線,只抓最近 {MAX_ALERT_BARS} 根(約 {MAX_ALERT_BARS // 1440} 天),更早的無法比較")
+            bars[sym] = fetch_klines(sym, "1m", min(n, MAX_ALERT_BARS), futures=True) if n else []
+        rows, n_open = review(recs, bars[sym], now)
+        name = os.path.basename(path).replace(".jsonl", "").replace("futures_", "")
+        groups[name], open_n = rows, open_n + n_open
+    print_review(groups, open_n, make_money(a.currency, a.twd_rate))
+    return 0
 
 
 def report_futures(path: str, recs: List[dict], money: Money = Money()) -> int:

@@ -1043,6 +1043,60 @@ class ReentryCooldownTest(unittest.TestCase):
             FuturesRiskConfig(reentry_cooldown_bars=-1).validate()
 
 
+class AlertReviewTest(unittest.TestCase):
+    """report --alerts:急跌檢查後的實際處理 vs 不減倉的反事實。"""
+
+    @staticmethod
+    def _journal():
+        def rec(ts, side, qty, price, alert=None, fee=0.0):
+            return {"kind": "futures", "ts": ts, "price": price, "alert": alert,
+                    "trade": {"side": side, "qty": qty, "price": price, "fee": fee, "realized_pnl": 0.0}}
+        return [rec(TS, "buy", 10, 100), rec(TS + 600, "sell", 5, 98, {"move_pct": 2, "stop_price": 96}),
+                rec(TS + 3600, "sell", 5, 97), rec(TS + 7200, "buy", 1, 97),  # 第二個部位沒有急跌檢查
+                rec(TS + 7300, "sell", 2, 96, {"move_pct": 1, "stop_price": 95}, fee=0.2)]  # 反手(多 1 → 空 1):舊倉結束
+
+    def test_review_counterfactuals(self):
+        from aitrader.alert_review import review, symbol_of
+        from aitrader.market import Candle
+        bars = [Candle(TS + i * 60, 98, 98.5, 97.5 if i < 90 else 95, 97, 1) for i in range(200)]
+        rows, open_n = review(self._journal(), bars, TS + 10 * 86400)
+        self.assertEqual(open_n, 0)
+        r = rows[0]
+        self.assertAlmostEqual(r["actual"], -5)  # 減半:5 × 0 + 5 × (97 - 98)
+        self.assertAlmostEqual(r["same"], -10)  # 不減倉、同時出場(60 分鐘內沒碰到 96):10 × (97 - 98)
+        self.assertAlmostEqual(r["hold"], -20)  # 抱著:第 90 分鐘碰到停損 96
+        self.assertEqual(r["hold_stop"], TS + 90 * 60)
+        self.assertIsNone(r["same_stop"])
+        self.assertAlmostEqual(rows[1]["actual"], -0.1)  # 反手只算平掉舊倉的 1 單位(手續費按比例),新倉不算
+        old, _ = review(self._journal(), bars[12:], TS + 10 * 86400)  # K 線從觸發之後才開始:無法比較
+        self.assertIsNone(old[0]["same"])
+        self.assertEqual((symbol_of("journal/futures_SOLUSDT_gemini_balanced.jsonl"),
+                          symbol_of("journal/futures_replay_SOLUSDT_rule.jsonl")), ("SOLUSDT", None))
+
+    def test_report_alerts_cli(self):
+        from aitrader.cli import main
+        from aitrader.market import Candle
+        bars = [Candle(TS + i * 60, 98, 98.5, 97.5, 97, 1) for i in range(200)]
+        with tempfile.TemporaryDirectory() as t:
+            paths = []
+            for name in ("futures_SOLUSDT_gemini.jsonl", "futures_SOLUSDT_gemini_balanced.jsonl"):
+                paths.append(os.path.join(t, name))
+                with open(paths[-1], "w") as fh:
+                    fh.write("\n".join(json.dumps(r) for r in self._journal()))
+            with mock.patch("aitrader.futures_cli.fetch_klines", return_value=bars) as fk, \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(main(["report", *paths, "--alerts"]), 0)
+                self.assertEqual(main(["report", *paths]), 0)  # 一般報表也可一次多個
+            self.assertEqual(fk.call_count, 1)  # 同交易對只抓一次 K 線
+            self.assertEqual(fk.call_args[0][1], "1m")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["report", os.path.join(t, "x.jsonl"), "--alerts"]), 2)
+        s = out.getvalue()
+        self.assertIn("合計 4 次", s)
+        self.assertIn("[SOLUSDT_gemini_balanced]", s)
+        self.assertEqual(s.count("合約日誌"), 2)
+
+
 class UrgentCheckTest(unittest.TestCase):
     """急跌檢查:持倉往不利方向走超過門檻時,不等整點立刻多問一次 AI;可部分減倉,減倉不占交易次數。"""
 

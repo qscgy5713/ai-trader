@@ -78,6 +78,9 @@ python3 -m aitrader futures-replay --model rule --limit 1000 --every 1
 # 11. 合約用台幣:本金 3 萬元、一天最多虧 1,000 元
 python3 -m aitrader futures --currency TWD --cash 30000 --daily-loss-amount 1000
 python3 -m aitrader report journal/futures_BTCUSDT_gemini.jsonl --currency TWD
+
+# 12. 檢驗急跌檢查的成效(可一次多個日誌;抓 1 分鐘 K 線比對,不呼叫 AI、不花錢)
+python3 -m aitrader report journal/futures_SOLUSDT_gemini.jsonl journal/futures_SOLUSDT_gemini_balanced.jsonl --alerts --currency TWD
 ```
 
 ### 子指令
@@ -88,7 +91,7 @@ python3 -m aitrader report journal/futures_BTCUSDT_gemini.jsonl --currency TWD
 | `paper` | 模擬盤。狀態存在 `state/`,重跑相同指令自動接續;Ctrl+C 會在安全點存檔結束(再按一次強制結束)。 |
 | `replay` | 歷史回放。決策後以**下一根 K 線開盤價**成交(避免偷看未來);每根 K 線都檢查停損。Gemini 回覆會快取在 `cache/`,重跑不重複付費。 |
 | `lessons` | 查看 AI 的學習狀況(心得、成績單、待檢討):`lessons state/futures_SOLUSDT_gemini.json`;`--import <日誌>` 從日誌最後一次成功的每日檢討匯入心得;模擬盤執行中也可以,會排入暫存檔,由執行中的程式在下一輪(數十秒內)套用。 |
-| `report` | 統計決策日誌:各種決策次數、成交、已實現損益、手續費、被風控擋下的原因、token 用量、最近決策與理由。網格日誌會自動改用網格報表。 |
+| `report` | 統計決策日誌:各種決策次數、成交、已實現損益、手續費、被風控擋下的原因、token 用量、最近決策與理由。網格日誌會自動改用網格報表。可一次給多個日誌。合約加 `--alerts`:檢驗急跌檢查成效,自觸發當下起比較「實際處理」、「不減倉、同時出場」、「不減倉、抱到停損或 24 小時」三種結果(反事實不含追蹤停損與資金費,僅供估計) |
 | `grid` | AI 調整網格的模擬盤,說明見下方「AI 調整網格模式」。 |
 | `grid-replay` | AI 調整網格的歷史回放。 |
 | `futures` | 合約模擬盤,說明見下方「合約模式」。 |
@@ -342,6 +345,7 @@ aitrader/
   runtime.py    安全停止(訊號)與可中斷等待
   multi.py      多交易對:每個交易對一個子程式、輸出加前綴
   dashboard.py  本機儀表板(python3 -m aitrader dashboard)
+  alert_review.py 急跌檢查成效檢驗(report --alerts)
   state.py      狀態原子寫入、檔案鎖、決策日誌
   cli.py        命令列入口(python3 -m aitrader)
 tests/          單元測試(Gemini 以模擬 HTTP 回應測試,不需金鑰;test_grid.py 網格、test_futures.py 合約、test_multi.py 多交易對、test_dashboard.py 儀表板)

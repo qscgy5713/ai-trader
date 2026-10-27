@@ -203,11 +203,11 @@ def _paper_loop(a, rc: RiskConfig, model, path: str, journal: str, stop: StopFla
 
 # ------------------------------ report ------------------------------
 
-def cmd_report(a) -> int:
-    if not os.path.exists(a.journal):
-        raise ValueError(f"找不到決策日誌 {a.journal}")
+def _load_journal(path: str) -> list:
+    if not os.path.exists(path):
+        raise ValueError(f"找不到決策日誌 {path}")
     recs = []
-    with open(a.journal) as fh:
+    with open(path) as fh:
         for line in fh:
             line = line.strip()
             if line:
@@ -216,14 +216,30 @@ def cmd_report(a) -> int:
                 except ValueError:
                     continue
     if not recs:
-        raise ValueError("日誌是空的")
+        raise ValueError(f"日誌是空的:{path}")
+    return recs
+
+
+def cmd_report(a) -> int:
+    if a.alerts:
+        from .futures_cli import report_alerts
+        return report_alerts(a)
+    code = 0
+    for i, journal in enumerate(a.journal):
+        if i:
+            print()
+        code = max(code, _report_one(a, journal, _load_journal(journal)))
+    return code
+
+
+def _report_one(a, journal: str, recs: list) -> int:
     if any(str(r.get("kind", "")).startswith("grid") for r in recs):
         from .grid_cli import report_grid
-        return report_grid(a.journal, recs)
+        return report_grid(journal, recs)
     if any(str(r.get("kind", "")).startswith("futures") for r in recs):
         from .currency import make_money
         from .futures_cli import report_futures
-        return report_futures(a.journal, recs, make_money(a.currency, a.twd_rate))
+        return report_futures(journal, recs, make_money(a.currency, a.twd_rate))
     decided = [r for r in recs if r.get("decision")]
     actions = Counter(r["decision"]["action"] for r in decided)
     trades = [r["trade"] for r in recs if r.get("trade")]
@@ -231,7 +247,7 @@ def cmd_report(a) -> int:
     fees = sum(t["fee"] for t in trades)
     tok_in = sum((r.get("meta") or {}).get("tokens_in", 0) for r in recs)
     tok_out = sum((r.get("meta") or {}).get("tokens_out", 0) for r in recs)
-    print(f"日誌 {a.journal}:{len(recs)} 筆紀錄({time.strftime('%m-%d %H:%M', time.localtime(recs[0]['ts']))} ~ "
+    print(f"日誌 {journal}:{len(recs)} 筆紀錄({time.strftime('%m-%d %H:%M', time.localtime(recs[0]['ts']))} ~ "
           f"{time.strftime('%m-%d %H:%M', time.localtime(recs[-1]['ts']))})")
     errors = [r for r in recs if r.get("error")]
     detail = ("(" + "、".join(f"{k} {v}" for k, v in actions.most_common()) + ")") if actions else ""
@@ -418,9 +434,12 @@ def main(argv=None) -> int:
     p.set_defaults(fn=cmd_dashboard)
 
     p = sub.add_parser("report", help="檢視決策日誌(一般、網格、合約模式皆可)")
-    p.add_argument("journal", help="日誌路徑,如 journal/paper_BTCUSDT_gemini.jsonl")
+    p.add_argument("journal", nargs="+", help="日誌路徑,如 journal/paper_BTCUSDT_gemini.jsonl(可多個)")
     p.add_argument("--currency", choices=["USDT", "TWD"], default="USDT", help="合約報表的金額幣別(預設 USDT)")
     p.add_argument("--twd-rate", type=float, help="USDT/TWD 匯率;不指定則從 MAX 取即時匯率")
+    p.add_argument("--alerts", action="store_true",
+                   help="合約:檢驗急跌檢查的成效(觸發後的實際處理 vs 不減倉的反事實,抓 1 分鐘 K 線比對)")
+    p.add_argument("--symbol", help="--alerts 用:日誌檔名看不出交易對時指定(只能搭配一個日誌)")
     p.set_defaults(fn=cmd_report)
 
     a = ap.parse_args(argv)
